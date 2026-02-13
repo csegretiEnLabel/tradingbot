@@ -64,21 +64,33 @@ class CostTracker:
         self.daily_trading_pnl = pnl
 
     def close_day(self):
-        """End-of-day: record daily summary and reset."""
-        record = {
-            "date": str(date.today()),
-            "api_cost": round(self.daily_api_cost, 6),
-            "trading_pnl": round(self.daily_trading_pnl, 4),
-            "net": round(self.daily_trading_pnl - self.daily_api_cost, 4),
-        }
-        self.history.append(record)
-        self._save_history()
+        """End-of-day: record daily summary and reset. Deduplicates by date."""
+        today = str(date.today())
 
-        logger.info(
-            f"Day closed | API cost: ${record['api_cost']:.4f} | "
-            f"Trading P&L: ${record['trading_pnl']:.4f} | "
-            f"Net: ${record['net']:.4f}"
-        )
+        # Prevent duplicate entries for the same date
+        if self.history and self.history[-1].get("date") == today:
+            logger.info(f"Day already closed for {today}, updating existing entry.")
+            # Update the existing entry with latest data (merge costs)
+            existing = self.history[-1]
+            existing["api_cost"] = round(existing["api_cost"] + self.daily_api_cost, 6)
+            existing["trading_pnl"] = round(self.daily_trading_pnl, 4)  # P&L is absolute, not additive
+            existing["net"] = round(existing["trading_pnl"] - existing["api_cost"], 4)
+            self._save_history()
+        else:
+            record = {
+                "date": today,
+                "api_cost": round(self.daily_api_cost, 6),
+                "trading_pnl": round(self.daily_trading_pnl, 4),
+                "net": round(self.daily_trading_pnl - self.daily_api_cost, 4),
+            }
+            self.history.append(record)
+            self._save_history()
+
+            logger.info(
+                f"Day closed | API cost: ${record['api_cost']:.4f} | "
+                f"Trading P&L: ${record['trading_pnl']:.4f} | "
+                f"Net: ${record['net']:.4f}"
+            )
 
         # Reset daily counters
         self.daily_api_cost = 0.0

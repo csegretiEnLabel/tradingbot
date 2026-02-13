@@ -290,18 +290,12 @@ class Trader:
 
     def update_stop_loss(self, symbol: str, new_stop_price: float) -> bool:
         """
-        Cancel existing stop-loss orders for a symbol and place a new one.
-        Used by the trailing stop mechanism.
+        Cancel existing stop/take-profit orders for a symbol and place a new stop.
+        Cancels ALL legs of any bracket/OCO group to avoid partial-bracket issues,
+        then places a standalone stop order.
         """
         try:
-            # Cancel existing orders for this symbol
-            orders = self.api.list_orders(status="open")
-            for order in orders:
-                if order.symbol == symbol and order.type in ("stop", "stop_limit"):
-                    self.api.cancel_order(order.id)
-                    logger.info(f"Cancelled old stop order for {symbol}: {order.id}")
-
-            # Get current position qty
+            # Get current position qty FIRST (before cancelling anything)
             try:
                 position = self.api.get_position(symbol)
                 qty = position.qty
@@ -309,7 +303,23 @@ class Trader:
                 logger.warning(f"No position found for {symbol}, skipping stop update")
                 return False
 
-            # Place new stop order
+            # Cancel ALL open orders for this symbol (stop, limit, and any OCO legs)
+            orders = self.api.list_orders(status="open")
+            cancelled_ids = []
+            for order in orders:
+                if order.symbol == symbol:
+                    try:
+                        self.api.cancel_order(order.id)
+                        cancelled_ids.append(order.id)
+                        logger.info(f"Cancelled order for {symbol}: {order.id} (type={order.type})")
+                    except Exception as cancel_err:
+                        logger.warning(f"Failed to cancel order {order.id}: {cancel_err}")
+
+            # Brief pause to let cancellations settle
+            if cancelled_ids:
+                time.sleep(0.5)
+
+            # Place new standalone stop order
             self.api.submit_order(
                 symbol=symbol,
                 qty=str(qty),
@@ -323,7 +333,22 @@ class Trader:
 
         except Exception as e:
             logger.error(f"Error updating stop loss for {symbol}: {e}")
-            return False
+            # Emergency fallback: try to place a stop even if something above failed
+            try:
+                position = self.api.get_position(symbol)
+                self.api.submit_order(
+                    symbol=symbol,
+                    qty=str(position.qty),
+                    side="sell",
+                    type="stop",
+                    time_in_force="gtc",
+                    stop_price=str(new_stop_price),
+                )
+                logger.info(f"FALLBACK STOP placed for {symbol} at ${new_stop_price:.2f}")
+                return True
+            except Exception as fallback_err:
+                logger.error(f"CRITICAL: Failed to place fallback stop for {symbol}: {fallback_err}")
+                return False
 
     def verify_order_fill(self, order_id: str, timeout: int = 10) -> Optional[dict]:
         """

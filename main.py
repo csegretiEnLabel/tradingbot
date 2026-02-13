@@ -15,7 +15,7 @@ import os
 import sys
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -140,7 +140,7 @@ def reconcile_vanished_positions(trader: Trader, agent: Agent, current_positions
 
         # Check Alpaca closed orders to find what happened
         closed_orders = trader.get_closed_orders_since(
-            after=_last_reconcile_time or datetime.utcnow().replace(hour=0, minute=0).isoformat() + "Z"
+            after=_last_reconcile_time or datetime.now(timezone.utc).replace(hour=0, minute=0).isoformat()
         )
 
         for symbol in vanished_symbols:
@@ -176,9 +176,12 @@ def reconcile_vanished_positions(trader: Trader, agent: Agent, current_positions
         }
         for p in current_positions
     }
-    _last_reconcile_time = datetime.utcnow().isoformat() + "Z"
+    _last_reconcile_time = datetime.now(timezone.utc).isoformat()
     save_known_positions()
 
+
+
+_model_upgraded = False  # Track whether scan model has been upgraded to Sonnet
 
 
 def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
@@ -199,6 +202,8 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
         logger.critical(kill_reason)
         logger.critical("AGENT SHUTTING DOWN — not self-sustaining.")
         trader.close_all_positions()
+        cost_tracker.update_trading_pnl(trader.get_account()["daily_pnl"])
+        cost_tracker.close_day()
         sys.exit(1)
 
     if not cost_tracker.within_daily_budget():
@@ -230,13 +235,15 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
             sys.exit(1)
 
         if account["equity"] > upgrade_threshold:
-            if config.MODEL_SCAN != config.MODEL_DECIDE:
+            global _model_upgraded
+            if not _model_upgraded:
                 logger.info(
                     f"🎉 Equity ${account['equity']:.2f} > ${upgrade_threshold:.2f} "
                     f"({config.MODEL_UPGRADE_GAIN_PCT:.0%} gain). "
                     f"Upgrading scan model to Sonnet for better decisions."
                 )
-                config.MODEL_SCAN = config.MODEL_DECIDE  # Upgrade to Sonnet
+                agent.scan_model = config.MODEL_DECIDE  # Upgrade via agent, not global config
+                _model_upgraded = True
 
     # ── Step 1: Check Existing Positions (Trailing Stops) ──
     risk_actions = risk_manager.check_existing_positions()
@@ -452,13 +459,19 @@ def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_t
                 risk_manager.reset_daily()
 
         # Skip first 15 minutes (too volatile)
-        if now.hour == config.MARKET_OPEN_HOUR and now.minute < 45:
-            logger.info("Waiting for market to settle (first 15 min)...")
+        market_open_minute = config.MARKET_OPEN_MIN + config.PRE_CLOSE_MIN  # 30 + 15 = 45
+        if now.hour == config.MARKET_OPEN_HOUR and now.minute < market_open_minute:
+            logger.info(f"Waiting for market to settle (until {config.MARKET_OPEN_HOUR}:{market_open_minute:02d})...")
             time.sleep(60)
             continue
 
         # Skip last 15 minutes (no new trades)
-        if now.hour == config.MARKET_CLOSE_HOUR - 1 and now.minute > (60 - config.PRE_CLOSE_MIN):
+        close_cutoff_hour = config.MARKET_CLOSE_HOUR
+        close_cutoff_min = 0 - config.PRE_CLOSE_MIN  # e.g., 16:00 - 15min = 15:45
+        if close_cutoff_min < 0:
+            close_cutoff_hour -= 1
+            close_cutoff_min += 60
+        if (now.hour > close_cutoff_hour) or (now.hour == close_cutoff_hour and now.minute >= close_cutoff_min):
             logger.info("Too close to market close. No new trades.")
             time.sleep(60)
             continue
@@ -498,6 +511,9 @@ def main():
     if not config.ALPACA_API_KEY or config.ALPACA_API_KEY == "your_paper_api_key_here":
         print("❌ Please set ALPACA_API_KEY in .env")
         sys.exit(1)
+    if not config.ALPACA_SECRET_KEY or config.ALPACA_SECRET_KEY == "your_paper_secret_key_here":
+        print("❌ Please set ALPACA_SECRET_KEY in .env")
+        sys.exit(1)
     if not config.ANTHROPIC_API_KEY or config.ANTHROPIC_API_KEY == "your_anthropic_key_here":
         print("❌ Please set ANTHROPIC_API_KEY in .env")
         sys.exit(1)
@@ -517,8 +533,6 @@ def main():
     # Fetch starting equity from Alpaca (dynamic, not hardcoded)
     starting_equity = trader.get_account()["equity"]
     logger.info(f"Starting equity: ${starting_equity:.2f} ({config.TRADING_MODE} mode)")
-    print(f"  💰 Starting equity: ${starting_equity:.2f}")
-
     print(f"  💰 Starting equity: ${starting_equity:.2f}")
 
     # Load persistent state

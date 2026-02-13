@@ -58,6 +58,7 @@ class Agent:
         self.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
         self.cost_tracker = cost_tracker
         self.equity = initial_equity  # Updated each cycle from live Alpaca data
+        self.scan_model = config.MODEL_SCAN  # Instance-level, can be upgraded at runtime
         self.recent_trades: list[dict] = []  # Track recent trades to avoid re-entry
         self.entry_times: dict[str, datetime] = {}  # symbol -> entry time
         self.trade_history: list[dict] = self._load_trade_history()  # Persistent
@@ -145,17 +146,43 @@ class Agent:
             return None
 
     def _parse_json(self, text: str) -> Optional[any]:
-        """Safely parse JSON from Claude response, handling markdown code blocks."""
+        """Safely parse JSON from Claude response, handling markdown code blocks and preamble text."""
         if not text:
             return None
         text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+
+        # Handle code blocks anywhere in the response (not just at the start)
+        if "```" in text:
+            # Find the first code block
+            start = text.find("```")
+            # Skip the ``` and optional language tag (e.g., ```json)
+            block_start = text.find("\n", start)
+            if block_start == -1:
+                block_start = start + 3
+            else:
+                block_start += 1
+            block_end = text.find("```", block_start)
+            if block_end != -1:
+                text = text[block_start:block_end].strip()
+
+        # Try parsing as-is first
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            logger.error(f"Failed to parse JSON: {text[:200]}")
-            return None
+            pass
+
+        # Fallback: try to find JSON array or object in the text
+        for start_char, end_char in [("[", "]"), ("{", "}")]:
+            start = text.find(start_char)
+            end = text.rfind(end_char)
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    continue
+
+        logger.error(f"Failed to parse JSON: {text[:200]}")
+        return None
 
     def record_trade(self, symbol: str, action: str, result: str):
         """Record a trade for context in future AI calls."""
@@ -175,8 +202,8 @@ class Agent:
         # Keep only last 10 trades
         self.recent_trades = self.recent_trades[-10:]
 
-    def _get_bars_held(self, symbol: str, bar_minutes: int = 30) -> int:
-        """Calculate how many bars a position has been held."""
+    def _get_bars_held(self, symbol: str, bar_minutes: int = 60) -> int:
+        """Calculate how many bars a position has been held (default: 1-hour bars)."""
         entry_time = self.entry_times.get(symbol)
         if not entry_time:
             return -1  # Unknown (position opened before agent started)
@@ -278,7 +305,7 @@ MAX 1 trade. Quality over quantity.
 JSON array: [{{"symbol","action","conviction":"high","reasoning":"<15 words why this won't fail","suggested_notional":$}}]
 Empty [] if nothing is A+ quality."""
 
-        response = self._call_claude(prompt, model=config.MODEL_SCAN)
+        response = self._call_claude(prompt, model=self.scan_model)
         if not response:
             return []
 
@@ -380,7 +407,7 @@ JSON — pick exactly one:
   {{"action": "close", "reasoning": "..."}}  
   {{"action": "update_stop", "new_stop_price": <number>, "reasoning": "..."}}"""
 
-        response = self._call_claude(prompt, model=config.MODEL_SCAN, max_tokens=256)
+        response = self._call_claude(prompt, model=self.scan_model, max_tokens=256)
         if not response:
             if pnl_pct < -0.01:
                 return {"action": "close", "reasoning": "AI unavailable + losing, closing for safety"}
@@ -424,5 +451,5 @@ Cover:
 3. What regime do you expect tomorrow? Plan accordingly.
 4. Are API costs justified by trading quality? If not, trade LESS."""
 
-        response = self._call_claude(prompt, model=config.MODEL_SCAN)
+        response = self._call_claude(prompt, model=self.scan_model)
         return response or "No review generated."
