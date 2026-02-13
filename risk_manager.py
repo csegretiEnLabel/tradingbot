@@ -1,5 +1,5 @@
 """
-Risk Manager — the guardrails that keep the account alive.
+Risk Manager -- the guardrails that keep the account alive.
 Every trade must pass through here before execution.
 """
 
@@ -45,7 +45,7 @@ class RiskManager:
         equity = account["equity"]
         cash = account["cash"]
 
-        # ── Check 1: Daily Loss Limit ────────────────
+        # -- Check 1: Daily Loss Limit ----------------
         daily_pnl_pct = account["daily_pnl_pct"]
         if daily_pnl_pct < -config.DAILY_LOSS_LIMIT_PCT:
             self._daily_loss_triggered = True
@@ -54,14 +54,14 @@ class RiskManager:
                 f"Daily loss limit hit ({daily_pnl_pct:.2%}). No more trades today."
             )
 
-        # ── Check 2: Max Positions ───────────────────
+        # -- Check 2: Max Positions -------------------
         if side == "buy" and len(positions) >= config.MAX_POSITIONS:
             return RiskDecision(
                 False, 0, 0, 0,
                 f"Max positions ({config.MAX_POSITIONS}) reached."
             )
 
-        # ── Check 3: Not Already Holding ─────────────
+        # -- Check 3: Not Already Holding -------------
         if side == "buy":
             held_symbols = [p["symbol"] for p in positions]
             if symbol in held_symbols:
@@ -70,14 +70,14 @@ class RiskManager:
                     f"Already holding {symbol}."
                 )
 
-        # ── Check 4: Minimum Account Value ───────────
+        # -- Check 4: Minimum Account Value -----------
         if equity < 5.0:
             return RiskDecision(
                 False, 0, 0, 0,
                 f"Account equity too low (${equity:.2f}). Agent should shut down."
             )
 
-        # ── Position Sizing ──────────────────────────
+        # -- Position Sizing --------------------------
         # Risk-based sizing: risk no more than 2% of equity per trade
         risk_per_trade = equity * 0.02  # 2% of current equity
         stop_distance = max(atr_pct * 1.5, config.STOP_LOSS_PCT)  # ATR-based or minimum
@@ -99,7 +99,7 @@ class RiskManager:
                 f"Calculated position (${position_size:.2f}) below minimum (${config.MIN_TRADE_VALUE})."
             )
 
-        # ── Dynamic Stop/Take-Profit ─────────────────
+        # -- Dynamic Stop/Take-Profit -----------------
         # Wider stops for volatile stocks, tighter for calm ones
         adjusted_stop = max(stop_distance, 0.015)  # At least 1.5%
         adjusted_stop = min(adjusted_stop, 0.05)    # At most 5%

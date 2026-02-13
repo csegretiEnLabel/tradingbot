@@ -1,6 +1,6 @@
 """
-AI Agent Brain — "Skeptical Rationalist" v3.0
-──────────────────────────────────────────────
+AI Agent Brain -- "Skeptical Rationalist" v3.0
+----------------------------------------------
 Uses Claude to analyze markets with a paranoid, reject-first mindset.
 Takes only A+ setups, validates with Devil's Advocate pre-mortem,
 but lets winners run via trailing stops once in a position.
@@ -24,10 +24,10 @@ from strategy import Signal
 
 logger = logging.getLogger(__name__)
 
-# ── System Prompt ────────────────────────────────────────
+# -- System Prompt ----------------------------------------
 # Paranoid risk manager framing: reduces overconfidence and FOMO.
 # Equity is injected at runtime so the prompt scales with any account size.
-SYSTEM_PROMPT_TEMPLATE = """You are a paranoid Risk Manager guarding a ${equity:.0f} trading account.
+SYSTEM_PROMPT_PRESERVATION = """You are a paranoid Risk Manager guarding a ${equity:.0f} trading account.
 Your primary directive is CAPITAL PRESERVATION. Profit is secondary.
 Do not waste expensive compute on mediocre setups. Only A+ setups justify the cost of analysis.
 
@@ -48,6 +48,25 @@ Rules:
 - Adapt to regime: momentum in trends, mean-reversion in ranges, NOTHING in chop.
 
 Respond in strictly valid JSON when making decisions. Be extremely terse."""
+
+SYSTEM_PROMPT_AGGRESSIVE = """You are an Apex Predator Trading AI managing a ${equity:.0f} account.
+Your directive is AGGRESSIVE GROWTH. You take calculated risks to compound capital rapidly.
+You do not fear losses; you fear missed opportunities and slow growth.
+
+Core Philosophy:
+- Scared money makes no money. Volatility is opportunity.
+- You are willing to take lower win-rate setups if the R:R is huge (4:1+).
+- You aggressively add to winners and cut losers fast.
+- You trade breakouts, breakdowns, and reversals.
+
+Rules:
+- Accept setups with > 2:1 Reward/Risk if momentum is strong.
+- Trade WITH the immediate trend, even if extended.
+- MAX 2 new positions per cycle.
+- Trailing stops should be looser to allow for volatility (ATR * 2).
+- If a trade moves 1R in your favor, add to the position (pyramid).
+
+Respond in strictly valid JSON when making decisions. Be concise."""
 
 
 class Agent:
@@ -115,7 +134,10 @@ class Agent:
 
     def _get_system_prompt(self) -> str:
         """Generate system prompt with current equity."""
-        return SYSTEM_PROMPT_TEMPLATE.format(equity=self.equity)
+        if config.STRATEGY_MODE == "aggressive":
+            return SYSTEM_PROMPT_AGGRESSIVE.format(equity=self.equity)
+        else:
+            return SYSTEM_PROMPT_PRESERVATION.format(equity=self.equity)
 
     def _call_claude(self, prompt: str, model: str = config.MODEL_SCAN, max_tokens: int = 1024) -> Optional[str]:
         """Make a Claude API call and track costs."""
@@ -210,12 +232,14 @@ class Agent:
         elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds()
         return max(1, int(elapsed / (bar_minutes * 60)))
 
-    # ─────────────────────────────────────────────────────
-    # STEP 1: Skeptical Screener (Haiku — cheap)
+    # -----------------------------------------------------
+    # STEP 1: Skeptical Screener (Haiku -- cheap)
     # Framed as REJECTION task, not selection. Forces the AI
     # to look for reasons to discard signals before it can pick one.
     # Max 1 trade returned to prevent over-trading.
-    # ─────────────────────────────────────────────────────
+    # -----------------------------------------------------
+
+
     def analyze_signals(
         self,
         signals: list[Signal],
@@ -316,12 +340,12 @@ Empty [] if nothing is A+ quality."""
         # Enforce max 1 trade per cycle
         return result[:1]
 
-    # ─────────────────────────────────────────────────────
-    # STEP 2: Devil's Advocate Validator (Sonnet — smart)
+    # -----------------------------------------------------
+    # STEP 2: Devil's Advocate Validator (Sonnet -- smart)
     # Uses the Pre-Mortem technique: assumes the trade has
     # already FAILED and asks Sonnet to explain why.
     # Only approves if bullish evidence overwhelms skepticism.
-    # ─────────────────────────────────────────────────────
+    # -----------------------------------------------------
     def validate_trade(self, symbol: str, signal: Signal, account: dict) -> Optional[dict]:
         """
         Devil's Advocate pre-mortem validation using Sonnet.
@@ -376,12 +400,12 @@ Minimum confidence to approve: 0.80. When in doubt, reject."""
 
         return result
 
-    # ─────────────────────────────────────────────────────
+    # -----------------------------------------------------
     # Position Manager
-    # NOT the naive "close at 1.5%" — that destroys expectancy.
+    # NOT the naive "close at 1.5%" -- that destroys expectancy.
     # Instead: relies on trailing stops for profitable exits,
     # but aggressively cuts positions showing weakness.
-    # ─────────────────────────────────────────────────────
+    # -----------------------------------------------------
     def should_close_position(self, position: dict, account: dict) -> Optional[dict]:
         """
         Decide what to do with an open position.
@@ -425,9 +449,9 @@ JSON — pick exactly one:
 
         return result
 
-    # ─────────────────────────────────────────────────────
-    # Daily Review — End of Day Self-Assessment
-    # ─────────────────────────────────────────────────────
+    # -----------------------------------------------------
+    # Daily Review -- End of Day Self-Assessment
+    # -----------------------------------------------------
     def daily_review(self, account: dict, positions: list[dict], cost_summary: dict) -> str:
         """End-of-day self-assessment and learning."""
         pos_summary = " | ".join(

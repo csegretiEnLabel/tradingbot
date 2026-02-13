@@ -25,9 +25,9 @@ class Trader:
             api_version="v2",
         )
         self.mode = config.TRADING_MODE
-        logger.info(f"Trader initialized in {self.mode.upper()} mode → {config.ALPACA_BASE_URL}")
+        logger.info(f"Trader initialized in {self.mode.upper()} mode -> {config.ALPACA_BASE_URL}")
 
-    # ── Account Info ─────────────────────────────────────
+    # -- Account Info -------------------------------------
 
     def get_account(self) -> dict:
         """Return account summary."""
@@ -63,17 +63,25 @@ class Trader:
     def get_position_count(self) -> int:
         return len(self.api.list_positions())
 
-    # ── Market Data ──────────────────────────────────────
+    # -- Market Data --------------------------------------
 
-    def get_bars(self, symbol: str, timeframe: str = "1Day", limit: int = 60) -> pd.DataFrame:
+    def get_bars(self, symbol: str, timeframe: str = "1Day", limit: int = None) -> pd.DataFrame:
         """
         Fetch historical bars for a symbol.
         timeframe: '1Min', '5Min', '15Min', '1Hour', '1Day'
         """
+        if limit is None:
+            limit = config.HISTORY_BARS_LIMIT
         try:
+            # For technical indicators, we need historical data.
+            # Alpaca V2 get_bars often needs a 'start' or it defaults to a very short window.
+            days_back = limit * 2 if "Day" in timeframe else (limit // 6 + 2)
+            start_time = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+
             bars = self.api.get_bars(
                 symbol,
                 timeframe,
+                start=start_time,
                 limit=limit,
             ).df
 
@@ -122,7 +130,7 @@ class Trader:
             logger.error(f"Error getting snapshot for {symbol}: {e}")
             return None
 
-    # ── Order Execution ──────────────────────────────────
+    # -- Order Execution ----------------------------------
 
     def buy(
         self,
@@ -220,7 +228,7 @@ class Trader:
         except Exception as e:
             logger.error(f"Error cancelling orders: {e}")
 
-    # ── Market Status ────────────────────────────────────
+    # -- Market Status ------------------------------------
 
     def is_market_open(self) -> bool:
         """Check if the market is currently open."""

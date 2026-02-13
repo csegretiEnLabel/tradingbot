@@ -22,7 +22,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Signal Cache ─────────────────────────────────────────
+# -- Signal Cache -----------------------------------------
 # Caches bar data for 15 minutes to avoid redundant Alpaca calls
 _bar_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 CACHE_TTL_SECONDS = 900  # 15 minutes
@@ -74,13 +74,13 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
     indicators = {}
 
-    # ── Moving Averages ──────────────────────────────
+    # -- Moving Averages ------------------------------
     indicators["sma_short"] = close.rolling(config.SMA_SHORT).mean().iloc[-1]
     indicators["sma_long"] = close.rolling(config.SMA_LONG).mean().iloc[-1]
     indicators["price"] = close.iloc[-1]
     indicators["sma_crossover"] = indicators["sma_short"] > indicators["sma_long"]
 
-    # ── RSI ───────────────────────────────────────────
+    # -- RSI -------------------------------------------
     if HAS_TA:
         rsi_series = ta.momentum.RSIIndicator(close, window=config.RSI_PERIOD).rsi()
         indicators["rsi"] = rsi_series.iloc[-1] if not rsi_series.empty else 50.0
@@ -129,13 +129,13 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         indicators["macd_bullish"] = False
         indicators["adx"] = 25.0  # default
 
-    # ── Volume Analysis ───────────────────────────────
+    # -- Volume Analysis -------------------------------
     avg_volume = volume.rolling(20).mean().iloc[-1]
     current_volume = volume.iloc[-1]
     indicators["volume_ratio"] = current_volume / avg_volume if avg_volume > 0 else 1.0
     indicators["volume_spike"] = indicators["volume_ratio"] > config.VOLUME_SPIKE_MULTIPLIER
 
-    # ── Price Change ──────────────────────────────────
+    # -- Price Change ----------------------------------
     indicators["change_1d"] = (close.iloc[-1] / close.iloc[-2] - 1) if len(close) >= 2 else 0
     indicators["change_5d"] = (close.iloc[-1] / close.iloc[-5] - 1) if len(close) >= 5 else 0
     indicators["change_20d"] = (close.iloc[-1] / close.iloc[-20] - 1) if len(close) >= 20 else 0
@@ -183,7 +183,7 @@ def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
     regime = detect_regime(indicators)
     indicators["regime"] = regime
 
-    # ── Buy Signals ──────────────────────────────────
+    # -- Buy Signals ----------------------------------
     if regime == "trending":
         # In trends: favor momentum (SMA, MACD) over mean-reversion (RSI)
         if sma_cross:
@@ -235,7 +235,7 @@ def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
         buy_score -= 0.15  # Stronger penalty for fighting trend
         reasons.append("Against daily trend (caution)")
 
-    # ── Sell Signals ─────────────────────────────────
+    # -- Sell Signals ---------------------------------
     if rsi > config.RSI_OVERBOUGHT:
         sell_score += 0.3
         reasons.append(f"RSI overbought ({rsi:.1f})")
@@ -252,11 +252,16 @@ def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
         sell_score += 0.15
         reasons.append(f"Near upper Bollinger Band ({bb_pct:.2f})")
 
-    # ── Determine Action ─────────────────────────────
+    # -- Determine Action -----------------------------
     atr_pct = indicators.get("atr_pct", 0.02)
 
     # Require higher threshold in volatile regime
-    min_score = 0.45 if regime == "volatile" else 0.4
+    # Require higher threshold in volatile regime
+    if config.STRATEGY_MODE == "aggressive":
+        min_score = 0.25 # Aggressive "Apex Predator" mode
+    else:
+        # Default "Preservation" mode
+        min_score = 0.45 if regime == "volatile" else 0.4
 
     if buy_score > sell_score and buy_score >= min_score:
         return Signal(symbol, "buy", buy_score, reasons, indicators, price, atr_pct)
@@ -277,7 +282,7 @@ def scan_universe(trader) -> list[Signal]:
     for symbol in config.WATCHLIST:
         try:
             # Daily bars: primary signal source (RSI-14, SMA-10/30, MACD all on daily)
-            df_daily = _get_cached_bars(trader, symbol, timeframe="1Day", limit=60)
+            df_daily = _get_cached_bars(trader, symbol, timeframe="1Day", limit=config.HISTORY_BARS_LIMIT)
             # Intraday bars for timing context
             df_intraday = _get_cached_bars(trader, symbol, timeframe="1Hour", limit=24)
 

@@ -1,5 +1,5 @@
 """
-Cost Tracker — monitors API spending vs trading profits.
+Cost Tracker -- monitors API spending vs trading profits.
 If costs consistently exceed profits, triggers the kill switch.
 The agent must pay for itself or die.
 """
@@ -131,7 +131,7 @@ class CostTracker:
         profitable_days = sum(1 for d in self.history if d["net"] > 0)
         total_days = len(self.history)
 
-        # ── Tax Estimation ──────────────────────────────
+        # -- Tax Estimation ------------------------------
         current_year = str(date.today().year)
         ytd_pnl = sum(d["trading_pnl"] for d in self.history if d["date"].startswith(current_year))
         ytd_pnl += self.daily_trading_pnl

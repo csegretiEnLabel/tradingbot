@@ -8,20 +8,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API Keys ──────────────────────────────────────────────
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+def reload_config():
+    """Reload environment variables from .env file."""
+    load_dotenv(override=True)
+    
+    global ANALYSIS_INTERVAL_MIN, DAILY_API_BUDGET, TRADING_MODE, STRATEGY_MODE
+    global ALPACA_BASE_URL, ALPACA_DATA_URL
+    global ANTHROPIC_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
+    global STRATEGY_MODE
 
-# ── Trading Mode ──────────────────────────────────────────
-TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper" or "live"
+    ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+    ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    TRADING_MODE = os.getenv("TRADING_MODE", "paper")
+    STRATEGY_MODE = os.getenv("STRATEGY_MODE", "preservation")
+    
+    ALPACA_BASE_URL = {
+        "paper": "https://paper-api.alpaca.markets",
+        "live": "https://api.alpaca.markets",
+    }[TRADING_MODE]
+    
+    DAILY_API_BUDGET = float(os.getenv("DAILY_API_BUDGET", "0.20"))
+    ANALYSIS_INTERVAL_MIN = int(os.getenv("ANALYSIS_INTERVAL_MIN", "5"))
 
-ALPACA_BASE_URL = {
-    "paper": "https://paper-api.alpaca.markets",
-    "live": "https://api.alpaca.markets",
-}[TRADING_MODE]
-
-ALPACA_DATA_URL = "https://data.alpaca.markets"
+# Initial load
+reload_config()
 
 # ── Risk Management ──────────────────────────────────────
 MAX_POSITION_PCT = 0.30          # Max 30% of portfolio per position
@@ -48,6 +59,7 @@ WATCHLIST = [
 ]
 
 # Technical indicator settings
+HISTORY_BARS_LIMIT = 60
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
@@ -59,24 +71,25 @@ SMA_LONG = 30
 VOLUME_SPIKE_MULTIPLIER = 1.5   # Volume must be 1.5x average
 
 # ── Scheduling ────────────────────────────────────────────
-ANALYSIS_INTERVAL_MIN = 60      # Run analysis every 60 minutes
+# ANALYSIS_INTERVAL_MIN is now managed by reload_config()
+MARKET_OPEN_HOUR = 9            # EST
 MARKET_OPEN_HOUR = 9            # EST
 MARKET_OPEN_MIN = 30
 MARKET_CLOSE_HOUR = 16
 PRE_CLOSE_MIN = 15              # Stop new trades 15 min before close
 
 # ── Cost Management ──────────────────────────────────────
-DAILY_API_BUDGET = float(os.getenv("DAILY_API_BUDGET", "0.20"))
+# DAILY_API_BUDGET is now managed by reload_config()
 
 # Claude model pricing (per 1M tokens)
 MODEL_COSTS = {
     "claude-3-5-haiku-20241022": {"input": 1.00, "output": 5.00},
-    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
+    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
 }
 
 # Use Haiku for routine work, Sonnet for critical decisions
 MODEL_SCAN = "claude-3-5-haiku-20241022"       # Market scanning (cheap)
-MODEL_DECIDE = "claude-sonnet-4-5-20250929"    # Trade decisions (smarter)
+MODEL_DECIDE = "claude-3-5-sonnet-20241022"    # Trade decisions (smarter)
 
 # Kill switch: if API costs > trading profits for N consecutive days, shut down
 COST_KILL_THRESHOLD_DAYS = 5
