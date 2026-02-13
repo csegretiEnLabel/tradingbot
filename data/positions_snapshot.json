@@ -1,4 +1,20 @@
 {
-  "positions": {},
-  "last_reconcile_time": "2026-02-13T17:17:32.361992+00:00"
+  "positions": {
+    "AMZN": {
+      "avg_entry_price": 187.479,
+      "qty": 10.0,
+      "unrealized_pl": 124.11
+    },
+    "AYI": {
+      "avg_entry_price": 299.56,
+      "qty": 10.0,
+      "unrealized_pl": 116.3
+    },
+    "NVDA": {
+      "avg_entry_price": 134.8,
+      "qty": 10.0,
+      "unrealized_pl": 495.7
+    }
+  },
+  "last_reconcile_time": "2026-02-13T18:44:32.984151+00:00"
 }
