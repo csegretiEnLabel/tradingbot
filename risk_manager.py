@@ -5,7 +5,6 @@ Every trade must pass through here before execution.
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import config
 

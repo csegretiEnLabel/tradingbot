@@ -29,7 +29,7 @@ CACHE_TTL_SECONDS = 900  # 15 minutes
 
 
 def _get_cached_bars(trader, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """Fetch bars with caching. Returns cached data if within TTL."""
+    """Fetch bars with caching. Returns cached data if within TTL. Evicts stale entries."""
     cache_key = f"{symbol}_{timeframe}_{limit}"
     now = time.time()
 
@@ -37,6 +37,11 @@ def _get_cached_bars(trader, symbol: str, timeframe: str, limit: int) -> pd.Data
         cached_time, cached_df = _bar_cache[cache_key]
         if now - cached_time < CACHE_TTL_SECONDS:
             return cached_df
+
+    # Evict stale entries (older than 2x TTL) to prevent unbounded growth
+    stale_keys = [k for k, (t, _) in _bar_cache.items() if now - t > CACHE_TTL_SECONDS * 2]
+    for k in stale_keys:
+        del _bar_cache[k]
 
     df = trader.get_bars(symbol, timeframe=timeframe, limit=limit)
     _bar_cache[cache_key] = (now, df)
