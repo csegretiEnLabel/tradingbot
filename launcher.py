@@ -31,6 +31,8 @@ def run_command(cmd, cwd=None, name="Process"):
     print(f"[START] Starting {name}...")
     # Use the local .venv python if it exists
     python_exe = os.path.join(os.getcwd(), ".venv", "Scripts", "python.exe")
+    print(python_exe)
+    
     if not os.path.exists(python_exe):
         python_exe = "python"
         
@@ -48,6 +50,21 @@ def run_command(cmd, cwd=None, name="Process"):
         universal_newlines=True
     )
 
+def read_process_output(process, max_lines=30):
+    """Read and return the last N lines from a process's output buffer."""
+    try:
+        lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            lines.append(line.strip())
+            if len(lines) > max_lines:
+                lines.pop(0)
+        return lines
+    except Exception:
+        return []
+
 def main():
     print("=== AI TRADING BOT UNIFIED LAUNCHER ===")
     
@@ -59,10 +76,42 @@ def main():
 
     # 1. Start API Backend
     api_process = run_command("python api.py", name="FastAPI Backend")
-    time.sleep(2)  # Wait for API to warm up
+    time.sleep(3)  # Wait for API to warm up
+    
+    # Check if API started successfully
+    if api_process.poll() is not None:
+        print("\n" + "="*60)
+        print("[FATAL ERROR] API Backend failed to start!")
+        print("="*60)
+        output = read_process_output(api_process, max_lines=50)
+        if output:
+            print("\n[ERROR OUTPUT]:")
+            for line in output:
+                print(f"  {line}")
+        else:
+            print("  (No output captured)")
+        print("="*60 + "\n")
+        return
     
     # 2. Start Dashboard Frontend
     dashboard_process = run_command("npm run dev", cwd="dashboard", name="Vite Dashboard")
+    time.sleep(2)
+    
+    # Check if dashboard started successfully
+    if dashboard_process.poll() is not None:
+        print("\n" + "="*60)
+        print("[FATAL ERROR] Dashboard failed to start!")
+        print("="*60)
+        output = read_process_output(dashboard_process, max_lines=50)
+        if output:
+            print("\n[ERROR OUTPUT]:")
+            for line in output:
+                print(f"  {line}")
+        else:
+            print("  (No output captured)")
+        print("="*60 + "\n")
+        api_process.terminate()
+        return
     
     # 3. Start the Trading Bot (main loop)
     # Using --status first to verify account
@@ -79,13 +128,37 @@ def main():
         while True:
             # Check if processes are still running
             if api_process.poll() is not None:
+                print("\n" + "="*60)
                 print("[ERROR] API Backend stopped unexpectedly.")
+                print("="*60)
+                output = read_process_output(api_process, max_lines=30)
+                if output:
+                    print("\n[LAST OUTPUT]:")
+                    for line in output:
+                        print(f"  {line}")
+                print("="*60 + "\n")
                 break
             if dashboard_process.poll() is not None:
+                print("\n" + "="*60)
                 print("[ERROR] Dashboard stopped unexpectedly.")
+                print("="*60)
+                output = read_process_output(dashboard_process, max_lines=30)
+                if output:
+                    print("\n[LAST OUTPUT]:")
+                    for line in output:
+                        print(f"  {line}")
+                print("="*60 + "\n")
                 break
             if bot_process.poll() is not None:
+                print("\n" + "="*60)
                 print("[ERROR] Trading Bot stopped unexpectedly.")
+                print("="*60)
+                output = read_process_output(bot_process, max_lines=30)
+                if output:
+                    print("\n[LAST OUTPUT]:")
+                    for line in output:
+                        print(f"  {line}")
+                print("="*60 + "\n")
                 break
                 
             # Optional: Stream bot output to console

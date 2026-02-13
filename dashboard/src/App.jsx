@@ -1,22 +1,22 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  TrendingUp, 
-  TrendingDown, 
-  Activity, 
-  DollarSign, 
-  PieChart, 
-  Terminal, 
-  ShieldCheck, 
-  AlertTriangle 
+import {
+  TrendingUp,
+  TrendingDown,
+  Activity,
+  DollarSign,
+  PieChart,
+  Terminal,
+  ShieldCheck,
+  AlertTriangle
 } from 'lucide-react';
-import { 
-  AreaChart, 
-  Area, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer 
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer
 } from 'recharts';
 
 const API_BASE = "http://localhost:8000/api";
@@ -33,10 +33,10 @@ function App() {
         fetch(`${API_BASE}/status`),
         fetch(`${API_BASE}/logs?limit=50`)
       ]);
-      
+
       const statusData = await statusRes.json();
       const logsData = await logsRes.json();
-      
+
       setData(statusData);
       setLogs(logsData.logs || []);
       setLoading(false);
@@ -57,15 +57,15 @@ function App() {
 
   // Calculate time until next run
   const [timeLeft, setTimeLeft] = useState("");
-  
+
   useEffect(() => {
     if (!bot_status?.next_run_time) return;
-    
+
     const timer = setInterval(() => {
       const now = new Date().getTime();
       const next = new Date(bot_status.next_run_time).getTime();
       const diff = next - now;
-      
+
       if (diff <= 0) {
         setTimeLeft("Running...");
       } else {
@@ -74,7 +74,7 @@ function App() {
         setTimeLeft(`${minutes}m ${seconds}s`);
       }
     }, 1000);
-    
+
     return () => clearInterval(timer);
   }, [bot_status?.next_run_time]);
 
@@ -97,7 +97,7 @@ function App() {
           <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>AI Agent Brain v3.0 | Paper Trading Mode</p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <select 
+          <select
             className="strategy-select"
             value={data?.settings?.strategy || "preservation"}
             onChange={async (e) => {
@@ -147,30 +147,30 @@ function App() {
       )}
 
       <div className="stats-grid">
-        <StatCard 
-          label="Total Equity" 
-          value={`$${account?.equity.toLocaleString()}`} 
+        <StatCard
+          label="Total Equity"
+          value={`$${account?.equity?.toLocaleString() || '0'}`}
           icon={<DollarSign size={18} />}
-          change={`${account?.daily_pnl_pct >= 0 ? '+' : ''}${(account?.daily_pnl_pct * 100).toFixed(2)}%`}
+          change={account?.daily_pnl_pct != null ? `${account.daily_pnl_pct >= 0 ? '+' : ''}${(account.daily_pnl_pct * 100).toFixed(2)}%` : 'N/A'}
           isUp={account?.daily_pnl_pct >= 0}
         />
-        <StatCard 
-          label="Daily P&L" 
-          value={`$${account?.daily_pnl.toFixed(2)}`} 
+        <StatCard
+          label="Daily P&L"
+          value={`$${account?.daily_pnl?.toFixed(2) || '0.00'}`}
           icon={<Activity size={18} />}
           isUp={account?.daily_pnl >= 0}
         />
-        <StatCard 
-          label="API Cost (Today)" 
-          value={`$${costs?.today_api_cost.toFixed(4)}`} 
+        <StatCard
+          label="API Cost (Today)"
+          value={`$${costs?.today_api_cost?.toFixed(4) || '0.0000'}`}
           icon={<ShieldCheck size={18} />}
-          subtext={`Budget: $${costs?.today_budget_remaining.toFixed(2)} left`}
+          subtext={costs?.today_budget_remaining != null ? `Budget: $${costs.today_budget_remaining.toFixed(2)} left` : 'N/A'}
         />
-        <StatCard 
-          label="Self-Sustaining" 
-          value={costs?.self_sustaining ? "YES" : "NO"} 
+        <StatCard
+          label="Self-Sustaining"
+          value={costs?.self_sustaining ? "YES" : "NO"}
           icon={<PieChart size={18} />}
-          subtext={`Net: $${costs?.total_net.toFixed(2)}`}
+          subtext={costs?.total_net != null ? `Net: $${costs.total_net.toFixed(2)}` : 'N/A'}
           isUp={costs?.self_sustaining}
         />
       </div>
@@ -234,14 +234,14 @@ function App() {
                 <AreaChart data={[]}>
                   <defs>
                     <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.3}/>
-                      <stop offset="95%" stopColor="var(--primary)" stopOpacity={0}/>
+                      <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.3} />
+                      <stop offset="95%" stopColor="var(--primary)" stopOpacity={0} />
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                   <XAxis dataKey="time" hide />
                   <YAxis hide domain={['auto', 'auto']} />
-                  <Tooltip 
+                  <Tooltip
                     contentStyle={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)', borderRadius: '8px' }}
                   />
                   <Area type="monotone" dataKey="value" stroke="var(--primary)" fillOpacity={1} fill="url(#colorValue)" />
@@ -266,7 +266,7 @@ function App() {
                 const levelMatch = log.match(/\[(INFO|WARNING|ERROR|CRITICAL)\]/);
                 const level = levelMatch ? levelMatch[1] : 'INFO';
                 const message = log.split('] ').pop();
-                
+
                 return (
                   <div key={i} className="log-item">
                     <span className="log-time">{time}</span>
