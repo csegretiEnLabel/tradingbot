@@ -13,6 +13,7 @@ import argparse
 import logging
 import os
 import sys
+import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -92,6 +93,36 @@ def check_status(trader: Trader, cost_tracker: CostTracker):
 # Track positions across cycles to detect broker-triggered closes
 _known_positions: dict[str, dict] = {}  # symbol -> {avg_entry_price, qty}
 _last_reconcile_time: str = ""  # ISO timestamp of last reconciliation
+SNAPSHOT_FILE = os.path.join("data", "positions_snapshot.json")
+
+
+def load_known_positions():
+    """Load known positions from disk to survive restarts."""
+    global _known_positions, _last_reconcile_time
+    try:
+        if os.path.exists(SNAPSHOT_FILE):
+            with open(SNAPSHOT_FILE, "r") as f:
+                data = json.load(f)
+                _known_positions = data.get("positions", {})
+                _last_reconcile_time = data.get("last_reconcile_time", "")
+                logger.info(f"Loaded {len(_known_positions)} known positions from snapshot.")
+    except Exception as e:
+        logger.error(f"Failed to load position snapshot: {e}")
+
+
+def save_known_positions():
+    """Save known positions to disk."""
+    global _known_positions, _last_reconcile_time
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(SNAPSHOT_FILE, "w") as f:
+            json.dump({
+                "positions": _known_positions,
+                "last_reconcile_time": _last_reconcile_time
+            }, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save position snapshot: {e}")
+
 
 
 def reconcile_vanished_positions(trader: Trader, agent: Agent, current_positions: list[dict]):
@@ -146,6 +177,8 @@ def reconcile_vanished_positions(trader: Trader, agent: Agent, current_positions
         for p in current_positions
     }
     _last_reconcile_time = datetime.utcnow().isoformat() + "Z"
+    save_known_positions()
+
 
 
 def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
@@ -486,7 +519,13 @@ def main():
     logger.info(f"Starting equity: ${starting_equity:.2f} ({config.TRADING_MODE} mode)")
     print(f"  💰 Starting equity: ${starting_equity:.2f}")
 
+    print(f"  💰 Starting equity: ${starting_equity:.2f}")
+
+    # Load persistent state
+    load_known_positions()
+
     agent_brain = Agent(cost_tracker, initial_equity=starting_equity)
+
 
     if args.status:
         check_status(trader, cost_tracker)

@@ -119,6 +119,14 @@ class CostTracker:
         profitable_days = sum(1 for d in self.history if d["net"] > 0)
         total_days = len(self.history)
 
+        # ── Tax Estimation ──────────────────────────────
+        current_year = str(date.today().year)
+        ytd_pnl = sum(d["trading_pnl"] for d in self.history if d["date"].startswith(current_year))
+        ytd_pnl += self.daily_trading_pnl
+        
+        # Conservative estimate: 35% short-term capital gains tax
+        estimated_tax = ytd_pnl * 0.35 if ytd_pnl > 0 else 0.0
+        
         return {
             "total_api_cost": round(total_api_cost, 4),
             "total_trading_pnl": round(total_pnl, 4),
@@ -129,4 +137,7 @@ class CostTracker:
             "today_api_cost": round(self.daily_api_cost, 4),
             "today_budget_remaining": round(config.DAILY_API_BUDGET - self.daily_api_cost, 4),
             "self_sustaining": total_net >= 0,
+            "ytd_pnl": round(ytd_pnl, 4),
+            "estimated_tax": round(estimated_tax, 4),
+            "ytd_net_after_tax": round(ytd_pnl - estimated_tax, 4),
         }

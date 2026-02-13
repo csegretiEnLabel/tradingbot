@@ -414,6 +414,7 @@ JSON — pick exactly one:
 
         prompt = f"""EOD Review. Be brutally honest. 4-5 sentences max.
 Equity=${account['equity']:.2f} dayPL={account['daily_pnl_pct']:.1%}
+YTD P&L=${cost_summary['ytd_pnl']:.2f} Est.Tax=${cost_summary['estimated_tax']:.2f} Net(AfterTax)=${cost_summary['ytd_net_after_tax']:.2f}
 Positions: {pos_summary}{trade_summary}
 API cost today=${cost_summary['today_api_cost']:.4f} total_net=${cost_summary['total_net']:.4f} sustaining={cost_summary['self_sustaining']}
 
