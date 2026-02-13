@@ -1,5 +1,5 @@
 """
-Risk Manager — the guardrails that keep the $50 alive.
+Risk Manager — the guardrails that keep the account alive.
 Every trade must pass through here before execution.
 """
 
@@ -79,8 +79,8 @@ class RiskManager:
             )
 
         # ── Position Sizing ──────────────────────────
-        # Risk-based sizing: risk no more than 1% of equity per trade
-        risk_per_trade = equity * 0.01  # $0.50 on a $50 account
+        # Risk-based sizing: risk no more than 2% of equity per trade
+        risk_per_trade = equity * 0.02  # 2% of current equity
         stop_distance = max(atr_pct * 1.5, config.STOP_LOSS_PCT)  # ATR-based or minimum
 
         # Position size = risk / stop_distance
@@ -124,16 +124,22 @@ class RiskManager:
 
     def check_existing_positions(self) -> list[dict]:
         """
-        Review existing positions and flag any that should be closed.
+        Review existing positions and return actionable trailing stop / emergency close decisions.
+        Implements a real trailing stop:
+          - At +3%: move stop to breakeven (entry price)
+          - At +5%: trail stop at 2% below current price
+          - At -4%: emergency close
         """
         positions = self.trader.get_positions()
         actions = []
 
         for pos in positions:
             pnl_pct = pos["unrealized_plpc"]
+            entry = pos["avg_entry_price"]
+            current = pos["current_price"]
 
-            # Emergency stop: if any position loses more than 5%, flag for close
-            if pnl_pct < -0.05:
+            # Emergency stop: if any position loses more than 4%, flag for close
+            if pnl_pct < -0.04:
                 actions.append({
                     "symbol": pos["symbol"],
                     "action": "emergency_close",
@@ -141,12 +147,26 @@ class RiskManager:
                     "unrealized_pl": pos["unrealized_pl"],
                 })
 
-            # Trailing take-profit: if up more than 8%, tighten mental stop
-            elif pnl_pct > 0.08:
+            # Trailing stop: position up >= activate threshold
+            elif pnl_pct >= config.TRAILING_ACTIVATE_PCT:
+                # Trail stop at TRAILING_TRAIL_PCT below current price
+                new_stop = round(current * (1 - config.TRAILING_TRAIL_PCT), 2)
                 actions.append({
                     "symbol": pos["symbol"],
-                    "action": "tighten_stop",
-                    "reason": f"Position up {pnl_pct:.1%}, consider tightening stop",
+                    "action": "update_trailing_stop",
+                    "stop_price": new_stop,
+                    "reason": f"Position up {pnl_pct:.1%}, trailing stop at ${new_stop:.2f}",
+                    "unrealized_pl": pos["unrealized_pl"],
+                })
+
+            # Breakeven stop: position up >= breakeven threshold but < full trail
+            elif pnl_pct >= config.TRAILING_BREAKEVEN_PCT:
+                breakeven_stop = round(entry * 1.001, 2)  # Tiny buffer above entry
+                actions.append({
+                    "symbol": pos["symbol"],
+                    "action": "update_trailing_stop",
+                    "stop_price": breakeven_stop,
+                    "reason": f"Position up {pnl_pct:.1%}, moving stop to breakeven ${breakeven_stop:.2f}",
                     "unrealized_pl": pos["unrealized_pl"],
                 })
 

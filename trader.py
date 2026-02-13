@@ -4,6 +4,7 @@ Supports both paper and live trading via config.
 """
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -258,3 +259,110 @@ class Trader:
         except Exception as e:
             logger.error(f"Error fetching orders: {e}")
             return []
+
+    def update_stop_loss(self, symbol: str, new_stop_price: float) -> bool:
+        """
+        Cancel existing stop-loss orders for a symbol and place a new one.
+        Used by the trailing stop mechanism.
+        """
+        try:
+            # Cancel existing orders for this symbol
+            orders = self.api.list_orders(status="open")
+            for order in orders:
+                if order.symbol == symbol and order.type in ("stop", "stop_limit"):
+                    self.api.cancel_order(order.id)
+                    logger.info(f"Cancelled old stop order for {symbol}: {order.id}")
+
+            # Get current position qty
+            try:
+                position = self.api.get_position(symbol)
+                qty = position.qty
+            except Exception:
+                logger.warning(f"No position found for {symbol}, skipping stop update")
+                return False
+
+            # Place new stop order
+            self.api.submit_order(
+                symbol=symbol,
+                qty=str(qty),
+                side="sell",
+                type="stop",
+                time_in_force="gtc",
+                stop_price=str(new_stop_price),
+            )
+            logger.info(f"TRAILING STOP: {symbol} new stop at ${new_stop_price:.2f}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error updating stop loss for {symbol}: {e}")
+            return False
+
+    def verify_order_fill(self, order_id: str, timeout: int = 10) -> Optional[dict]:
+        """
+        Wait for an order to be filled, up to timeout seconds.
+        Returns filled order details or None.
+        """
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                order = self.api.get_order(order_id)
+                if order.status == "filled":
+                    return {
+                        "id": order.id,
+                        "symbol": order.symbol,
+                        "filled_qty": float(order.filled_qty),
+                        "filled_avg_price": float(order.filled_avg_price),
+                        "status": order.status,
+                    }
+                elif order.status in ("cancelled", "expired", "rejected"):
+                    logger.warning(f"Order {order_id} ended with status: {order.status}")
+                    return None
+            except Exception as e:
+                logger.error(f"Error checking order {order_id}: {e}")
+            time.sleep(1)
+
+        logger.warning(f"Order {order_id} not filled within {timeout}s")
+        return None
+
+    def get_market_context(self) -> dict:
+        """
+        Get broad market context (SPY trend, volatility proxy) for AI prompts.
+        """
+        context = {
+            "spy_trend": "unknown",
+            "spy_change_1d": 0.0,
+            "spy_change_5d": 0.0,
+            "market_volatility": "normal",
+        }
+        try:
+            bars = self.get_bars("SPY", timeframe="1Day", limit=30)
+            if not bars.empty and len(bars) >= 5:
+                close = bars["close"]
+                context["spy_change_1d"] = (close.iloc[-1] / close.iloc[-2] - 1)
+                context["spy_change_5d"] = (close.iloc[-1] / close.iloc[-5] - 1)
+
+                sma_10 = close.rolling(10).mean().iloc[-1]
+                sma_20 = close.rolling(20).mean().iloc[-1]
+                if sma_10 > sma_20:
+                    context["spy_trend"] = "bullish"
+                else:
+                    context["spy_trend"] = "bearish"
+
+                # Volatility proxy: recent ATR as % of price
+                high = bars["high"]
+                low = bars["low"]
+                tr = pd.concat([
+                    high - low,
+                    (high - close.shift(1)).abs(),
+                    (low - close.shift(1)).abs(),
+                ], axis=1).max(axis=1)
+                atr_pct = tr.rolling(14).mean().iloc[-1] / close.iloc[-1]
+                if atr_pct > 0.02:
+                    context["market_volatility"] = "high"
+                elif atr_pct < 0.008:
+                    context["market_volatility"] = "low"
+
+        except Exception as e:
+            logger.error(f"Error getting market context: {e}")
+
+        return context

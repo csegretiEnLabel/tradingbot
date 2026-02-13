@@ -47,7 +47,7 @@ def print_banner():
     mode = config.TRADING_MODE.upper()
     banner = f"""
 ╔══════════════════════════════════════════════════╗
-║        🤖 AI TRADING AGENT v1.0                 ║
+║        🤖 AI TRADING AGENT v2.0                 ║
 ║        Mode: {mode:<8s}                            ║
 ║        {'⚠️  REAL MONEY' if mode == 'LIVE' else '📝 Paper Trading'}                          ║
 ╚══════════════════════════════════════════════════╝
@@ -88,7 +88,7 @@ def check_status(trader: Trader, cost_tracker: CostTracker):
     print()
 
 
-def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker):
+def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
     """
     Run one complete analysis → decision → execution cycle.
     """
@@ -115,26 +115,34 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
     account = trader.get_account()
     positions = trader.get_positions()
 
-    # ── Rule of 10: Portfolio-Based Kill/Upgrade ─────
+    # Update agent's equity awareness for dynamic prompts
+    agent.equity = account["equity"]
+
+    # ── Portfolio-Based Kill/Upgrade (percentage of starting equity) ──
     if config.TRADING_MODE == "live":
-        if account["equity"] < config.HARD_KILL_EQUITY:
+        kill_threshold = starting_equity * (1 - config.HARD_KILL_DRAWDOWN_PCT)
+        upgrade_threshold = starting_equity * (1 + config.MODEL_UPGRADE_GAIN_PCT)
+
+        if account["equity"] < kill_threshold:
             logger.critical(
-                f"HARD KILL: Equity ${account['equity']:.2f} < ${config.HARD_KILL_EQUITY}. "
+                f"HARD KILL: Equity ${account['equity']:.2f} < ${kill_threshold:.2f} "
+                f"({config.HARD_KILL_DRAWDOWN_PCT:.0%} drawdown from ${starting_equity:.2f}). "
                 f"Experiment failed. Closing all positions and shutting down."
             )
             trader.close_all_positions()
             cost_tracker.close_day()
             sys.exit(1)
 
-        if account["equity"] > config.MODEL_UPGRADE_EQUITY:
+        if account["equity"] > upgrade_threshold:
             if config.MODEL_SCAN != config.MODEL_DECIDE:
                 logger.info(
-                    f"🎉 Equity ${account['equity']:.2f} > ${config.MODEL_UPGRADE_EQUITY}. "
+                    f"🎉 Equity ${account['equity']:.2f} > ${upgrade_threshold:.2f} "
+                    f"({config.MODEL_UPGRADE_GAIN_PCT:.0%} gain). "
                     f"Upgrading scan model to Sonnet for better decisions."
                 )
                 config.MODEL_SCAN = config.MODEL_DECIDE  # Upgrade to Sonnet
 
-    # ── Step 1: Check Existing Positions ─────────────
+    # ── Step 1: Check Existing Positions (Trailing Stops) ──
     risk_actions = risk_manager.check_existing_positions()
     for action in risk_actions:
         if action["action"] == "emergency_close":
@@ -145,11 +153,24 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
             )
             if decision and decision.get("close", True):
                 trader.sell(action["symbol"])
+                agent.record_trade(action["symbol"], "sell", "emergency_close")
                 logger.info(f"Closed {action['symbol']}: {decision.get('reasoning', '')}")
-        elif action["action"] == "tighten_stop":
-            logger.info(f"Consider tightening stop on {action['symbol']}: {action['reason']}")
 
-    # ── Step 2: Scan for New Opportunities ───────────
+        elif action["action"] == "update_trailing_stop":
+            stop_price = action.get("stop_price")
+            if stop_price:
+                logger.info(f"Updating trailing stop: {action['symbol']} → ${stop_price:.2f} ({action['reason']})")
+                trader.update_stop_loss(action["symbol"], stop_price)
+
+    # ── Step 2: Get Market Context ───────────────────
+    market_context = trader.get_market_context()
+    logger.info(
+        f"Market context: SPY {market_context['spy_trend']} "
+        f"1d={market_context['spy_change_1d']:.1%} "
+        f"volatility={market_context['market_volatility']}"
+    )
+
+    # ── Step 3: Scan for New Opportunities ───────────
     logger.info(f"Scanning {len(config.WATCHLIST)} symbols...")
     signals = scan_universe(trader)
     buy_signals = [s for s in signals if s.action == "buy"]
@@ -160,8 +181,8 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
 
     logger.info(f"Found {len(buy_signals)} buy signals. Consulting AI...")
 
-    # ── Step 3: AI Analysis (Haiku - cheap) ──────────
-    trade_ideas = agent.analyze_signals(signals, account, positions)
+    # ── Step 4: AI Analysis (Haiku - cheap) ──────────
+    trade_ideas = agent.analyze_signals(signals, account, positions, market_context)
 
     if not trade_ideas:
         logger.info("AI found no compelling trades. Staying in cash.")
@@ -169,7 +190,7 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
 
     logger.info(f"AI suggested {len(trade_ideas)} trade(s)")
 
-    # ── Step 4: Execute Trades ───────────────────────
+    # ── Step 5: Execute Trades ───────────────────────
     for idea in trade_ideas:
         symbol = idea.get("symbol")
         action = idea.get("action", "buy")
@@ -201,6 +222,7 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
             validation = agent.validate_trade(matching_signal, matching_signal, account)
             if validation and not validation.get("approved", False):
                 logger.info(f"Sonnet rejected {symbol}: {validation.get('reasoning', '')}")
+                agent.record_trade(symbol, "buy", "sonnet_rejected")
                 continue
             if validation:
                 # Use Sonnet's refined parameters
@@ -224,9 +246,17 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
         )
 
         if result:
-            logger.info(f"Order placed: {result}")
+            # Verify fill
+            fill = trader.verify_order_fill(result["id"])
+            if fill:
+                logger.info(f"Order FILLED: {fill}")
+                agent.record_trade(symbol, "buy", "filled")
+            else:
+                logger.warning(f"Order placed but fill not confirmed: {result}")
+                agent.record_trade(symbol, "buy", "unconfirmed")
         else:
             logger.error(f"Order failed for {symbol}")
+            agent.record_trade(symbol, "buy", "failed")
 
     # ── Update Cost Tracker ──────────────────────────
     cost_tracker.update_trading_pnl(account["daily_pnl"])
@@ -252,7 +282,7 @@ def run_daily_review(trader: Trader, agent: Agent, cost_tracker: CostTracker):
     print(f"\n📋 DAILY REVIEW:\n{review}\n")
 
 
-def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker):
+def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
     """
     Main trading loop. Runs during market hours.
     """
@@ -305,7 +335,7 @@ def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_t
         # Run cycle at configured interval
         if last_cycle_time is None or (now - last_cycle_time) >= interval:
             try:
-                run_cycle(trader, agent, risk_manager, cost_tracker)
+                run_cycle(trader, agent, risk_manager, cost_tracker, starting_equity)
                 last_cycle_time = now
                 consecutive_errors = 0
             except KeyboardInterrupt:
@@ -352,7 +382,13 @@ def main():
     trader = Trader()
     cost_tracker = CostTracker()
     risk_manager = RiskManager(trader)
-    agent_brain = Agent(cost_tracker)
+
+    # Fetch starting equity from Alpaca (dynamic, not hardcoded)
+    starting_equity = trader.get_account()["equity"]
+    logger.info(f"Starting equity: ${starting_equity:.2f} ({config.TRADING_MODE} mode)")
+    print(f"  💰 Starting equity: ${starting_equity:.2f}")
+
+    agent_brain = Agent(cost_tracker, initial_equity=starting_equity)
 
     if args.status:
         check_status(trader, cost_tracker)
@@ -364,7 +400,7 @@ def main():
 
     if args.once:
         if trader.is_market_open():
-            run_cycle(trader, agent_brain, risk_manager, cost_tracker)
+            run_cycle(trader, agent_brain, risk_manager, cost_tracker, starting_equity)
             check_status(trader, cost_tracker)
         else:
             print("Market is closed. Showing status instead.")
@@ -373,7 +409,7 @@ def main():
 
     # Full trading loop
     try:
-        trading_loop(trader, agent_brain, risk_manager, cost_tracker)
+        trading_loop(trader, agent_brain, risk_manager, cost_tracker, starting_equity)
     except KeyboardInterrupt:
         logger.info("Shutting down gracefully...")
         check_status(trader, cost_tracker)

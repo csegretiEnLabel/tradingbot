@@ -24,22 +24,27 @@ ALPACA_BASE_URL = {
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 
 # ── Risk Management ──────────────────────────────────────
-MAX_POSITION_PCT = 0.20          # Max 20% of portfolio per position
+MAX_POSITION_PCT = 0.30          # Max 30% of portfolio per position
 MAX_POSITIONS = 3                # Max concurrent open positions
 DAILY_LOSS_LIMIT_PCT = 0.03     # Stop trading after 3% daily loss
 STOP_LOSS_PCT = 0.025           # 2.5% stop-loss per trade
 TAKE_PROFIT_PCT = 0.05          # 5% take-profit per trade
 MIN_TRADE_VALUE = 1.00          # Minimum trade value in USD (Alpaca supports fractional)
-MAX_TRADE_VALUE_PCT = 0.20      # Max single trade as % of equity
+MAX_TRADE_VALUE_PCT = 0.30      # Max single trade as % of equity
+
+# ── Trailing Stop ─────────────────────────────────────────
+TRAILING_BREAKEVEN_PCT = 0.03   # Move stop to breakeven when up 3%
+TRAILING_TRAIL_PCT = 0.02       # Trail stop 2% behind highest price once up 5%
+TRAILING_ACTIVATE_PCT = 0.05    # Activate trailing stop when up 5%
 
 # ── Strategy Parameters ──────────────────────────────────
-# Universe: liquid, low-price stocks suitable for a $50 account
+# Universe: liquid, low-price stocks suitable for small accounts
 WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META",   # mega-cap tech (fractional)
-    "NVDA", "AMD", "INTC",                       # semiconductors
-    "SPY", "QQQ", "IWM",                          # ETFs
-    "SOFI", "PLTR", "NIO", "RIVN",               # lower-priced momentum
-    "F", "BAC", "T", "SNAP",                      # affordable stocks
+    "SOFI", "PLTR", "NIO", "RIVN", "LCID",      # momentum / growth (< $20)
+    "F", "BAC", "T", "SNAP", "WBD",              # affordable value stocks
+    "AMD", "INTC", "MU", "HOOD",                  # semi / fintech (moderate price)
+    "MARA", "RIOT", "COIN",                        # crypto-adjacent volatility
+    "SPY", "QQQ", "IWM",                           # ETFs — for context & trading
 ]
 
 # Technical indicator settings
@@ -76,9 +81,10 @@ MODEL_DECIDE = "claude-sonnet-4-5-20250929"    # Trade decisions (smarter)
 # Kill switch: if API costs > trading profits for N consecutive days, shut down
 COST_KILL_THRESHOLD_DAYS = 5
 
-# "Rule of 10" — portfolio-based kill/upgrade thresholds (for live trading)
-HARD_KILL_EQUITY = 45.0         # If equity drops below this, shut down permanently
-MODEL_UPGRADE_EQUITY = 60.0     # If equity exceeds this, upgrade scan model to Sonnet
+# Portfolio-based kill/upgrade thresholds (for live trading)
+# These are percentages of STARTING equity (fetched on startup)
+HARD_KILL_DRAWDOWN_PCT = 0.10   # If equity drops 10% from start, shut down permanently
+MODEL_UPGRADE_GAIN_PCT = 0.20   # If equity grows 20% from start, upgrade scan model
 
 # ── Logging ───────────────────────────────────────────────
 LOG_DIR = "logs"

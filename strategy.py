@@ -1,11 +1,12 @@
 """
 Technical analysis and signal generation.
-Computes indicators and generates candidate trade signals
-that feed into the AI agent for final decision-making.
+Computes indicators on DAILY bars (primary) and uses intraday for timing context.
+Includes signal caching to reduce redundant API calls.
 """
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -20,6 +21,26 @@ except ImportError:
 import config
 
 logger = logging.getLogger(__name__)
+
+# ── Signal Cache ─────────────────────────────────────────
+# Caches bar data for 15 minutes to avoid redundant Alpaca calls
+_bar_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+CACHE_TTL_SECONDS = 900  # 15 minutes
+
+
+def _get_cached_bars(trader, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Fetch bars with caching. Returns cached data if within TTL."""
+    cache_key = f"{symbol}_{timeframe}_{limit}"
+    now = time.time()
+
+    if cache_key in _bar_cache:
+        cached_time, cached_df = _bar_cache[cache_key]
+        if now - cached_time < CACHE_TTL_SECONDS:
+            return cached_df
+
+    df = trader.get_bars(symbol, timeframe=timeframe, limit=limit)
+    _bar_cache[cache_key] = (now, df)
+    return df
 
 
 @dataclass
@@ -84,6 +105,13 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         atr = ta.volatility.AverageTrueRange(high, low, close, window=14)
         indicators["atr"] = atr.average_true_range().iloc[-1]
         indicators["atr_pct"] = indicators["atr"] / close.iloc[-1] if close.iloc[-1] > 0 else 0
+
+        # ADX for trend strength / regime detection
+        adx_indicator = ta.trend.ADXIndicator(high, low, close, window=14)
+        indicators["adx"] = adx_indicator.adx().iloc[-1]
+        indicators["di_plus"] = adx_indicator.adx_pos().iloc[-1]
+        indicators["di_minus"] = adx_indicator.adx_neg().iloc[-1]
+
     else:
         # Fallback RSI calculation
         delta = close.diff()
@@ -94,6 +122,7 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         indicators["rsi"] = rsi.iloc[-1] if not rsi.empty else 50.0
         indicators["atr_pct"] = 0.02  # default
         indicators["macd_bullish"] = False
+        indicators["adx"] = 25.0  # default
 
     # ── Volume Analysis ───────────────────────────────
     avg_volume = volume.rolling(20).mean().iloc[-1]
@@ -109,9 +138,26 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     return indicators
 
 
+def detect_regime(indicators: dict) -> str:
+    """
+    Simple market regime detection using ADX.
+    Returns 'trending', 'ranging', or 'volatile'.
+    """
+    adx = indicators.get("adx", 25)
+    atr_pct = indicators.get("atr_pct", 0.02)
+
+    if adx > 30:
+        return "trending"
+    elif adx < 20 and atr_pct < 0.025:
+        return "ranging"
+    else:
+        return "volatile"
+
+
 def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
     """
     Generate a trading signal based on technical indicators.
+    Adapts signal weights based on market regime.
     This is a rule-based pre-filter; the AI agent makes the final call.
     """
     if not indicators:
@@ -128,34 +174,60 @@ def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
     bb_pct = indicators.get("bb_pct", 0.5)
     change_5d = indicators.get("change_5d", 0)
 
+    # Detect regime and adjust weights
+    regime = detect_regime(indicators)
+    indicators["regime"] = regime
+
     # ── Buy Signals ──────────────────────────────────
-    if rsi < config.RSI_OVERSOLD:
-        buy_score += 0.3
-        reasons.append(f"RSI oversold ({rsi:.1f})")
+    if regime == "trending":
+        # In trends: favor momentum (SMA, MACD) over mean-reversion (RSI)
+        if sma_cross:
+            buy_score += 0.3
+            reasons.append("SMA bullish crossover (trending)")
+        if macd_bull:
+            buy_score += 0.25
+            reasons.append("MACD bullish (trending)")
+        if rsi < config.RSI_OVERSOLD:
+            buy_score += 0.15
+            reasons.append(f"RSI oversold ({rsi:.1f})")
+    elif regime == "ranging":
+        # In ranges: favor mean-reversion (RSI, BB) over momentum
+        if rsi < config.RSI_OVERSOLD:
+            buy_score += 0.35
+            reasons.append(f"RSI oversold ({rsi:.1f}) (ranging)")
+        if bb_pct < 0.15:
+            buy_score += 0.25
+            reasons.append(f"Near lower BB ({bb_pct:.2f}) (ranging)")
+        if macd_bull:
+            buy_score += 0.1
+            reasons.append("MACD bullish")
+    else:
+        # Volatile: standard weights but require stronger signals
+        if rsi < config.RSI_OVERSOLD:
+            buy_score += 0.25
+            reasons.append(f"RSI oversold ({rsi:.1f})")
+        if sma_cross:
+            buy_score += 0.2
+            reasons.append("SMA short > SMA long (bullish)")
+        if macd_bull:
+            buy_score += 0.2
+            reasons.append("MACD bullish crossover")
+        if bb_pct < 0.2:
+            buy_score += 0.1
+            reasons.append(f"Near lower Bollinger Band ({bb_pct:.2f})")
 
-    if sma_cross:
-        buy_score += 0.2
-        reasons.append("SMA short > SMA long (bullish)")
-
-    if macd_bull:
-        buy_score += 0.2
-        reasons.append("MACD bullish crossover")
-
-    if bb_pct < 0.2:
-        buy_score += 0.15
-        reasons.append(f"Near lower Bollinger Band ({bb_pct:.2f})")
-
+    # Volume confirmation (all regimes)
     if volume_spike and change_5d > 0:
         buy_score += 0.15
         reasons.append("Volume spike with positive momentum")
 
-    # Bonus: intraday signal aligned with daily trend
+    # Daily trend alignment bonus
     daily_trend = indicators.get("daily_trend_up")
     if daily_trend is True:
         buy_score += 0.1
         reasons.append("Aligned with daily uptrend")
     elif daily_trend is False:
-        buy_score -= 0.1
+        buy_score -= 0.15  # Stronger penalty for fighting trend
         reasons.append("Against daily trend (caution)")
 
     # ── Sell Signals ─────────────────────────────────
@@ -178,9 +250,12 @@ def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
     # ── Determine Action ─────────────────────────────
     atr_pct = indicators.get("atr_pct", 0.02)
 
-    if buy_score > sell_score and buy_score >= 0.4:
+    # Require higher threshold in volatile regime
+    min_score = 0.45 if regime == "volatile" else 0.4
+
+    if buy_score > sell_score and buy_score >= min_score:
         return Signal(symbol, "buy", buy_score, reasons, indicators, price, atr_pct)
-    elif sell_score > buy_score and sell_score >= 0.4:
+    elif sell_score > buy_score and sell_score >= min_score:
         return Signal(symbol, "sell", sell_score, reasons, indicators, price, atr_pct)
     else:
         return Signal(symbol, "hold", max(buy_score, sell_score), reasons or ["No strong signal"], indicators, price, atr_pct)
@@ -189,30 +264,37 @@ def generate_signal(symbol: str, indicators: dict, price: float) -> Signal:
 def scan_universe(trader) -> list[Signal]:
     """
     Scan the entire watchlist and return ranked signals.
-    Uses two timeframes:
-      - 1Hour bars for intraday signals (reacts to today's price action)
-      - 1Day bars for trend context (SMA crossovers, multi-day momentum)
+    Uses DAILY bars as the primary signal source (correct timeframe for RSI/MACD/SMA).
+    Overlays intraday bars for timing context.
     """
     signals = []
 
     for symbol in config.WATCHLIST:
         try:
-            # Intraday bars for live signals (updates every hour)
-            df_intraday = trader.get_bars(symbol, timeframe="1Hour", limit=60)
-            # Daily bars for trend context
-            df_daily = trader.get_bars(symbol, timeframe="1Day", limit=60)
+            # Daily bars: primary signal source (RSI-14, SMA-10/30, MACD all on daily)
+            df_daily = _get_cached_bars(trader, symbol, timeframe="1Day", limit=60)
+            # Intraday bars for timing context
+            df_intraday = _get_cached_bars(trader, symbol, timeframe="1Hour", limit=24)
 
-            # Use intraday for indicator calculation (RSI, MACD respond to recent action)
-            df = df_intraday if not df_intraday.empty else df_daily
-            if df.empty:
+            # Use daily for indicator calculation (correct timeframe for RSI-14 etc.)
+            if df_daily.empty:
                 continue
 
-            indicators = compute_indicators(df)
+            indicators = compute_indicators(df_daily)
             if not indicators:
                 continue
 
-            # Overlay daily trend context if available
-            if not df_daily.empty and len(df_daily) >= config.SMA_LONG:
+            # Overlay intraday timing context
+            if not df_intraday.empty and len(df_intraday) >= 5:
+                intraday_close = df_intraday["close"]
+                # Intraday momentum: how is the stock moving today?
+                indicators["intraday_change"] = (intraday_close.iloc[-1] / intraday_close.iloc[0] - 1) \
+                    if len(intraday_close) >= 2 else 0
+                # Use latest intraday price as "current" price
+                indicators["price"] = intraday_close.iloc[-1]
+
+            # Daily trend context (SMA comparison on daily bars)
+            if len(df_daily) >= config.SMA_LONG:
                 daily_close = df_daily["close"]
                 indicators["daily_sma_short"] = daily_close.rolling(config.SMA_SHORT).mean().iloc[-1]
                 indicators["daily_sma_long"] = daily_close.rolling(config.SMA_LONG).mean().iloc[-1]
