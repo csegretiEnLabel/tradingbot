@@ -47,6 +47,19 @@ Rules:
 - Skip the first 15 minutes after market open.
 - Adapt to regime: momentum in trends, mean-reversion in ranges, NOTHING in chop.
 
+Quantitative Strategies (KAMA, Trend Follow, Momentum):
+- You have access to signals from proven quant algorithms alongside technical indicators.
+- KAMA (Kaufman Adaptive Moving Average): adapts to volatility. High efficiency ratio = strong trend.
+  A KAMA crossover (price crossing KAMA) is a meaningful signal. Respect it.
+- Trend Follow (SMA-3/SMA-20 crossover): medium-term trend detection.
+  Fresh crossovers are stronger than sustained trends. Bearish crossovers = exit signal.
+- Momentum (rolling returns): shows which stocks have strongest directional momentum.
+  Positive momentum + technical buy = high-conviction. Negative momentum + technical buy = suspicious.
+- When quant strategies AGREE with technical signals, conviction should increase.
+- When quant strategies DISAGREE with technical signals, be extra cautious.
+- A KAMA or Trend crossover on a stock with no technical buy signal may still be worth acting on
+  IF the efficiency ratio is high and momentum confirms.
+
 Respond in strictly valid JSON when making decisions. Be extremely terse."""
 
 SYSTEM_PROMPT_AGGRESSIVE = """You are an Apex Predator Trading AI managing a ${equity:.0f} account.
@@ -65,6 +78,14 @@ Rules:
 - MAX 2 new positions per cycle.
 - Trailing stops should be looser to allow for volatility (ATR * 2).
 - If a trade moves 1R in your favor, add to the position (pyramid).
+
+Quantitative Strategies (KAMA, Trend Follow, Momentum):
+- You have access to proven quant algorithm signals. USE THEM AGGRESSIVELY.
+- KAMA crossovers with high efficiency ratio = high-conviction entries.
+- Trend Follow crossovers (SMA-3/SMA-20) confirm momentum direction.
+- Strong momentum readings amplify your conviction on trending stocks.
+- When ALL three quant strategies agree on BUY, this is a strong entry signal.
+- Quant-promoted stocks (weak technical but strong quant) are fair game for aggressive entries.
 
 Respond in strictly valid JSON when making decisions. Be concise."""
 
@@ -246,10 +267,13 @@ class Agent:
         account: dict,
         positions: list[dict],
         market_context: Optional[dict] = None,
+        quant_signals_text: str = "",
     ) -> list[dict]:
         """
         Skeptical signal screener. Rejects most signals; returns at most 1 trade.
         Filters out wash-sale-blacklisted symbols BEFORE Claude sees them.
+        Now includes quant strategy signals (KAMA, Trend Follow, Momentum) as
+        additional intelligence for the AI to factor into decisions.
         Uses Haiku for cost efficiency.
         """
         if not signals:
@@ -260,7 +284,7 @@ class Agent:
         clean_signals = []
         for s in signals:
             if s.symbol in banned:
-                logger.info(f"⛔ WASH SALE: Skipping {s.symbol} (sold at loss within 31 days)")
+                logger.info(f"WASH SALE: Skipping {s.symbol} (sold at loss within 31 days)")
             else:
                 clean_signals.append(s)
 
@@ -272,11 +296,12 @@ class Agent:
         signal_lines = []
         for s in clean_signals[:8]:
             regime = s.indicators.get("regime", "?")
+            quant_tag = " [QUANT-PROMOTED]" if s.indicators.get("quant_promoted") else ""
             signal_lines.append(
                 f"{s.symbol} | {s.action} | str={s.strength:.2f} | ${s.price:.2f} | "
                 f"RSI={s.indicators.get('rsi', 0):.0f} vol={s.indicators.get('volume_ratio', 1):.1f}x "
                 f"1d={s.indicators.get('change_1d', 0):.1%} 5d={s.indicators.get('change_5d', 0):.1%} "
-                f"atr={s.atr_pct:.1%} regime={regime} adx={s.indicators.get('adx', 0):.0f} | "
+                f"atr={s.atr_pct:.1%} regime={regime} adx={s.indicators.get('adx', 0):.0f}{quant_tag} | "
                 f"{'; '.join(s.reasons[:3])}"
             )
 
@@ -306,13 +331,23 @@ class Agent:
             recent = [f"{t['symbol']}({t['action']}→{t['result']})" for t in self.recent_trades[-5:]]
             trade_line = f"\nRecent: {' | '.join(recent)}"
 
+        # Quant signals section
+        quant_section = ""
+        if quant_signals_text and quant_signals_text != "No quant signals active.":
+            quant_section = f"""
+
+QUANT STRATEGY SIGNALS (KAMA, Trend Follow, Momentum):
+{quant_signals_text}
+NOTE: Quant signals are from proven algorithms. When quant agrees with technical, conviction is higher.
+[QUANT-PROMOTED] means weak technical but strong quant support -- evaluate carefully."""
+
         prompt = f"""Review these signals with extreme skepticism. Most should be REJECTED.
 
 Acct: ${account['equity']:.2f} cash=${account['cash']:.2f} positions={len(positions)} dayPL={account['daily_pnl_pct']:.1%}{ctx_line}
 {"Holding: " + " | ".join(pos_lines) if pos_lines else "No positions"}{trade_line}
 
-Signals:
-{chr(10).join(signal_lines)}
+Technical Signals:
+{chr(10).join(signal_lines)}{quant_section}
 
 REJECTION CRITERIA (discard if ANY apply):
 - Volume < 1.2x relative average
@@ -321,7 +356,7 @@ REJECTION CRITERIA (discard if ANY apply):
 - Against SPY/market direction
 - Similar trade recently failed
 - Regime is "volatile" with ADX < 20 (choppy, no edge)
-- Signal strength < 0.5
+- Signal strength < 0.5 (UNLESS quant strategies strongly agree)
 
 Return the SINGLE best A+ setup, or empty [] if nothing qualifies.
 MAX 1 trade. Quality over quantity.
@@ -346,12 +381,36 @@ Empty [] if nothing is A+ quality."""
     # already FAILED and asks Sonnet to explain why.
     # Only approves if bullish evidence overwhelms skepticism.
     # -----------------------------------------------------
-    def validate_trade(self, symbol: str, signal: Signal, account: dict) -> Optional[dict]:
+    def validate_trade(
+        self,
+        symbol: str,
+        signal: Signal,
+        account: dict,
+        quant_consensus: Optional[dict] = None,
+    ) -> Optional[dict]:
         """
         Devil's Advocate pre-mortem validation using Sonnet.
         Assumes the trade will fail, and asks for evidence to override that assumption.
         Only called for high-conviction trades that passed the skeptical screener.
+        Now includes quant strategy consensus for richer context.
         """
+        # Build quant context line
+        quant_line = ""
+        if quant_consensus and quant_consensus.get("strategies"):
+            strategies = quant_consensus["strategies"]
+            quant_parts = [
+                f"{s['strategy'].upper()}={s['action']}(str={s['strength']:.2f})"
+                for s in strategies
+            ]
+            agreement = quant_consensus.get("agreement", 0)
+            quant_line = (
+                f"\nQuant consensus: {quant_consensus['action'].upper()} "
+                f"(agreement={agreement:.0%}) | {' '.join(quant_parts)}"
+            )
+
+        is_quant_promoted = signal.indicators.get("quant_promoted", False)
+        promo_note = "\nNOTE: This is a QUANT-PROMOTED signal (weak technical, strong quant support)." if is_quant_promoted else ""
+
         prompt = f"""CRITIQUE this trade proposal. Act as Devil's Advocate.
 
 Proposed: BUY {symbol} @ ${signal.price:.2f}
@@ -360,15 +419,17 @@ SMA_cross={signal.indicators.get('sma_crossover', '?')} ADX={signal.indicators.g
 Vol={signal.indicators.get('volume_ratio', 1):.1f}x 1d={signal.indicators.get('change_1d', 0):.1%}
 5d={signal.indicators.get('change_5d', 0):.1%} ATR={signal.atr_pct:.1%}
 Regime={signal.indicators.get('regime', '?')}
-Acct: ${account['equity']:.2f}
+Acct: ${account['equity']:.2f}{quant_line}{promo_note}
 
 Task:
 1. Assume this trade has already FAILED. List 3 reasons why it lost money.
 2. Now consider: does the bullish evidence overwhelm those failure scenarios?
-3. Only approve if you genuinely believe the setup is exceptional.
-4. If approved, set a TIGHT stop loss (ATR-based, 1.5-2.5%).
-5. Take profit should be >= 3x the stop distance (enforce 3:1 R:R minimum).
-6. Remember: ~40% of gains go to short-term capital gains tax. A small win is breakeven after tax.
+3. Factor in quant strategy signals: KAMA, Trend Follow, and Momentum readings.
+   If quant strategies unanimously agree, that is meaningful supporting evidence.
+4. Only approve if you genuinely believe the setup is exceptional.
+5. If approved, set a TIGHT stop loss (ATR-based, 1.5-2.5%).
+6. Take profit should be >= 3x the stop distance (enforce 3:1 R:R minimum).
+7. Remember: ~40% of gains go to short-term capital gains tax. A small win is breakeven after tax.
 
 JSON only:
 {{

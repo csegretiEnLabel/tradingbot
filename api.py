@@ -15,6 +15,12 @@ from cost_tracker import CostTracker
 class SettingsUpdate(BaseModel):
     strategy: str
 
+class QuantSettingsUpdate(BaseModel):
+    kama_enabled: Optional[bool] = None
+    trend_enabled: Optional[bool] = None
+    momentum_enabled: Optional[bool] = None
+    auto_trade: Optional[bool] = None
+
 app = FastAPI(title="Trading Bot API")
 
 # Enable CORS for frontend development
@@ -31,6 +37,7 @@ LOG_DIR = "logs"
 SNAPSHOT_FILE = os.path.join(DATA_DIR, "positions_snapshot.json")
 COST_FILE = os.path.join(LOG_DIR, "cost_tracker.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "trade_history.json")
+QUANT_STATUS_FILE = os.path.join(DATA_DIR, "quant_status.json")
 
 def load_json(path):
     if os.path.exists(path):
@@ -48,13 +55,16 @@ async def get_status():
         trader = Trader()
         account = trader.get_account()
         positions = trader.get_positions()
-        
+
         cost_tracker = CostTracker()
         cost_summary = cost_tracker.get_summary()
 
         # Load bot status (execution times)
         bot_status = load_json(os.path.join(DATA_DIR, "bot_status.json"))
-        
+
+        # Load quant status if available
+        quant_status = load_json(QUANT_STATUS_FILE)
+
         return {
             "account": {
                 "equity": account["equity"],
@@ -65,11 +75,15 @@ async def get_status():
             },
             "positions": positions,
             "costs": cost_summary,
-            "costs": cost_summary,
             "bot_status": bot_status,
             "settings": {
-                "strategy": config.STRATEGY_MODE
+                "strategy": config.STRATEGY_MODE,
+                "quant_kama_enabled": config.QUANT_KAMA_ENABLED,
+                "quant_trend_enabled": config.QUANT_TREND_ENABLED,
+                "quant_momentum_enabled": config.QUANT_MOMENTUM_ENABLED,
+                "quant_auto_trade": config.QUANT_AUTO_TRADE,
             },
+            "quant_status": quant_status,
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
@@ -106,34 +120,96 @@ async def update_settings(settings: SettingsUpdate):
         new_mode = settings.strategy.lower()
         if new_mode not in ["preservation", "aggressive"]:
             raise HTTPException(status_code=400, detail="Invalid strategy mode")
-            
-        # Update .env file
-        env_path = ".env"
-        lines = []
-        if os.path.exists(env_path):
-            with open(env_path, "r") as f:
-                lines = f.readlines()
-        
-        # Check if STRATEGY_MODE exists, update or append
-        found = False
-        for i, line in enumerate(lines):
-            if line.startswith("STRATEGY_MODE="):
-                lines[i] = f"STRATEGY_MODE={new_mode}\n"
-                found = True
-                break
-        
-        if not found:
-            lines.append(f"\nSTRATEGY_MODE={new_mode}\n")
-            
-        with open(env_path, "w") as f:
-            f.writelines(lines)
-            
-        # Reload config in this process
+
+        _update_env_var("STRATEGY_MODE", new_mode)
         config.reload_config()
-        
+
         return {"status": "success", "mode": new_mode}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/quant/status")
+async def get_quant_status():
+    """Return current quant strategy status and recent signals."""
+    quant_status = load_json(QUANT_STATUS_FILE)
+    return {
+        "settings": {
+            "kama_enabled": config.QUANT_KAMA_ENABLED,
+            "trend_enabled": config.QUANT_TREND_ENABLED,
+            "momentum_enabled": config.QUANT_MOMENTUM_ENABLED,
+            "auto_trade": config.QUANT_AUTO_TRADE,
+        },
+        "kama_params": {
+            "period": config.QUANT_KAMA_PERIOD,
+            "fast": config.QUANT_KAMA_FAST,
+            "slow": config.QUANT_KAMA_SLOW,
+        },
+        "trend_params": {
+            "sma_short": config.QUANT_TREND_SMA_SHORT,
+            "sma_long": config.QUANT_TREND_SMA_LONG,
+        },
+        "momentum_params": {
+            "lookback_months": config.QUANT_MOMENTUM_LOOKBACK,
+            "top_n": config.QUANT_MOMENTUM_TOP_N,
+        },
+        "signals": quant_status.get("signals", {}) if quant_status else {},
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.post("/api/quant/settings")
+async def update_quant_settings(settings: QuantSettingsUpdate):
+    """Update quant strategy settings and persist to .env."""
+    try:
+        updates = {}
+        if settings.kama_enabled is not None:
+            updates["QUANT_KAMA_ENABLED"] = str(settings.kama_enabled).lower()
+        if settings.trend_enabled is not None:
+            updates["QUANT_TREND_ENABLED"] = str(settings.trend_enabled).lower()
+        if settings.momentum_enabled is not None:
+            updates["QUANT_MOMENTUM_ENABLED"] = str(settings.momentum_enabled).lower()
+        if settings.auto_trade is not None:
+            updates["QUANT_AUTO_TRADE"] = str(settings.auto_trade).lower()
+
+        for key, value in updates.items():
+            _update_env_var(key, value)
+
+        config.reload_config()
+
+        return {
+            "status": "success",
+            "settings": {
+                "kama_enabled": config.QUANT_KAMA_ENABLED,
+                "trend_enabled": config.QUANT_TREND_ENABLED,
+                "momentum_enabled": config.QUANT_MOMENTUM_ENABLED,
+                "auto_trade": config.QUANT_AUTO_TRADE,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _update_env_var(key: str, value: str):
+    """Update or append a key=value pair in the .env file."""
+    env_path = ".env"
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            lines = f.readlines()
+
+    found = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}\n"
+            found = True
+            break
+
+    if not found:
+        lines.append(f"{key}={value}\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
 
 if __name__ == "__main__":
     import uvicorn

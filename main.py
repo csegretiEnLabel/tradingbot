@@ -28,8 +28,9 @@ from zoneinfo import ZoneInfo
 import config
 from agent import Agent
 from cost_tracker import CostTracker
+from quant_engine import QuantEngine
 from risk_manager import RiskManager
-from strategy import scan_universe
+from strategy import scan_universe, enrich_signals_with_quant
 from trader import Trader
 
 # -- Logging Setup -----------------------------------------
@@ -190,9 +191,18 @@ def reconcile_vanished_positions(trader: Trader, agent: Agent, current_positions
 _model_upgraded = False  # Track whether scan model has been upgraded to Sonnet
 
 
-def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
+def run_cycle(
+    trader: Trader,
+    agent: Agent,
+    risk_manager: RiskManager,
+    cost_tracker: CostTracker,
+    starting_equity: float,
+    quant_engine: QuantEngine = None,
+):
     """
-    Run one complete analysis → decision → execution cycle.
+    Run one complete analysis -> decision -> execution cycle.
+    Now integrates quantitative strategy signals (KAMA, Trend Follow, Momentum)
+    alongside existing technical analysis for richer AI decision-making.
     """
     logger.info("=" * 50)
     logger.info("Starting analysis cycle")
@@ -292,9 +302,34 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
         f"volatility={market_context['market_volatility']}"
     )
 
-    # -- Step 3: Scan for New Opportunities -----------
-    logger.info(f"Scanning {len(config.WATCHLIST)} symbols...")
+    # -- Step 3: Scan for New Opportunities (Technical) -----------
+    logger.info(f"Scanning {len(config.WATCHLIST)} symbols (technical)...")
     signals = scan_universe(trader)
+
+    # Build a lookup map of ALL signals (buy + sell + hold) for quant promotion.
+    # scan_universe returns all signal types so quant can promote hold -> buy.
+    all_signals_map = {s.symbol: s for s in signals}
+
+    # -- Step 3.5: Run Quantitative Strategies -------------------
+    quant_signals = {}
+    quant_signals_text = ""
+    if quant_engine and quant_engine.is_active():
+        logger.info("[QUANT] Running quantitative strategy scan...")
+        quant_signals = quant_engine.scan_universe(trader)
+        quant_signals_text = quant_engine.format_for_ai(quant_signals)
+
+        # Promote hold signals to buy candidates if quant strategies support them
+        quant_buy_symbols = quant_engine.get_quant_buy_symbols(quant_signals)
+        if quant_buy_symbols:
+            logger.info(
+                f"[QUANT] Buy signals from quant strategies: "
+                f"{', '.join(sorted(quant_buy_symbols))}"
+            )
+            signals = enrich_signals_with_quant(
+                signals, quant_buy_symbols, all_signals_map
+            )
+    else:
+        logger.info("[QUANT] No quant strategies active this cycle.")
 
     # Filter: don't show AI signals for stocks we already hold (no pyramiding)
     current_holdings = {p["symbol"] for p in positions}
@@ -307,8 +342,13 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
     logger.info(f"Found {len(buy_signals)} buy signal(s). Consulting skeptical screener...")
 
     # -- Step 4: Skeptical Screener (Haiku -- cheap) ---
-    # Returns at most 1 trade idea (max 1 per cycle enforced in agent)
-    trade_ideas = agent.analyze_signals(signals, account, positions, market_context)
+    # Pass only buy+sell signals to AI (hold signals waste tokens).
+    # Quant-promoted signals are already in the list from enrich_signals_with_quant.
+    actionable_signals = [s for s in signals if s.action in ("buy", "sell")]
+    trade_ideas = agent.analyze_signals(
+        actionable_signals, account, positions, market_context,
+        quant_signals_text=quant_signals_text,
+    )
 
     if not trade_ideas:
         logger.info("Screener rejected all signals. No A+ setups. Staying in cash.")
@@ -323,11 +363,22 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
         logger.info(f"Screener suggested non-buy action for {symbol}: {action}. Skipping.")
         return
 
-    # Find matching signal
-    matching_signal = next((s for s in signals if s.symbol == symbol), None)
+    # Find matching signal (prefer buy signals over hold for the same symbol,
+    # since quant-promoted buys coexist with original hold signals in the list)
+    matching_signal = next(
+        (s for s in signals if s.symbol == symbol and s.action == "buy"),
+        next((s for s in signals if s.symbol == symbol), None),
+    )
     if not matching_signal:
         logger.warning(f"Signal not found for {symbol}. Skipping.")
         return
+
+    # Log if this was a quant-promoted signal
+    if matching_signal.indicators.get("quant_promoted"):
+        logger.info(
+            f"[QUANT] AI selected QUANT-PROMOTED signal for {symbol} "
+            f"(weak technical, strong quant support)"
+        )
 
     # -- Step 5: Risk Manager Check -------------------
     risk = risk_manager.check_trade(
@@ -343,9 +394,20 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
 
     # -- Step 6: Devil's Advocate Validation (Sonnet) -
     # EVERY trade goes through pre-mortem. No exceptions.
-    # This is the most important gate -- Sonnet is smarter and catches what Haiku misses.
+    # Now includes quant consensus for richer context.
     logger.info(f"Validating {symbol} with Devil's Advocate (Sonnet)...")
-    validation = agent.validate_trade(symbol, matching_signal, account)
+    quant_consensus = None
+    if quant_engine and quant_signals:
+        quant_consensus = quant_engine.get_consensus(quant_signals, symbol)
+        if quant_consensus.get("strategies"):
+            logger.info(
+                f"[QUANT] Consensus for {symbol}: {quant_consensus['action'].upper()} "
+                f"(agreement={quant_consensus['agreement']:.0%})"
+            )
+
+    validation = agent.validate_trade(
+        symbol, matching_signal, account, quant_consensus=quant_consensus
+    )
 
     if not validation or not validation.get("approved", False):
         reasons = validation.get("failure_reasons", []) if validation else ["API error"]
@@ -376,8 +438,15 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
     notional = min(notional, idea.get("suggested_notional", notional))
     notional = max(notional, config.MIN_TRADE_VALUE)
 
+    # Log execution with quant context
+    quant_tag = ""
+    if matching_signal.indicators.get("quant_promoted"):
+        quant_tag = " [QUANT-PROMOTED]"
+    elif quant_consensus and quant_consensus.get("action") == "buy":
+        quant_tag = " [QUANT-CONFIRMED]"
+
     logger.info(
-        f"[EXEC] EXECUTING: BUY {symbol} | ${notional:.2f} | "
+        f"[EXEC] EXECUTING: BUY {symbol}{quant_tag} | ${notional:.2f} | "
         f"SL: {sl:.1%} | TP: {tp:.1%} | "
         f"Confidence: {validation.get('confidence', '?')} | "
         f"R:R = 1:{tp/sl:.1f}"
@@ -444,9 +513,17 @@ def save_bot_status(last_run: datetime, next_run: datetime):
         logger.error(f"Failed to save bot status: {e}")
 
 
-def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
+def trading_loop(
+    trader: Trader,
+    agent: Agent,
+    risk_manager: RiskManager,
+    cost_tracker: CostTracker,
+    starting_equity: float,
+    quant_engine: QuantEngine = None,
+):
     """
     Main trading loop. Runs during market hours.
+    Now integrates quantitative strategy engine for KAMA, Trend Follow, and Momentum signals.
     """
     logger.info("Entering trading loop...")
     risk_manager.reset_daily()
@@ -458,8 +535,8 @@ def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_t
 
     # Initialize status file
     save_bot_status(
-        datetime.now(ET), 
-        datetime.now(ET) + timedelta(seconds=10) # Initial short delay
+        datetime.now(ET),
+        datetime.now(ET) + timedelta(seconds=10)  # Initial short delay
     )
 
     while True:
@@ -509,13 +586,16 @@ def trading_loop(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_t
         # Run cycle at configured interval
         config.reload_config()
         interval = timedelta(minutes=config.ANALYSIS_INTERVAL_MIN)
-        
+
         if last_cycle_time is None or (now - last_cycle_time) >= interval:
             try:
-                run_cycle(trader, agent, risk_manager, cost_tracker, starting_equity)
+                run_cycle(
+                    trader, agent, risk_manager, cost_tracker,
+                    starting_equity, quant_engine=quant_engine,
+                )
                 last_cycle_time = now
                 consecutive_errors = 0
-                
+
                 # Update status with next run time
                 next_run = now + interval
                 save_bot_status(now, next_run)
@@ -579,6 +659,14 @@ def main():
 
     agent_brain = Agent(cost_tracker, initial_equity=starting_equity)
 
+    # Initialize Quantitative Strategy Engine
+    quant_eng = QuantEngine()
+    if quant_eng.is_active():
+        active = quant_eng._active_strategy_names()
+        print(f"  [QUANT] Active strategies: {', '.join(active)}")
+        print(f"  [QUANT] Auto-trade: {'ON' if config.QUANT_AUTO_TRADE else 'OFF (advisory only)'}")
+    else:
+        print("  [QUANT] No quant strategies enabled.")
 
     if args.status:
         check_status(trader, cost_tracker)
@@ -590,7 +678,10 @@ def main():
 
     if args.once:
         if trader.is_market_open():
-            run_cycle(trader, agent_brain, risk_manager, cost_tracker, starting_equity)
+            run_cycle(
+                trader, agent_brain, risk_manager, cost_tracker,
+                starting_equity, quant_engine=quant_eng,
+            )
             check_status(trader, cost_tracker)
         else:
             print("Market is closed. Showing status instead.")
@@ -599,7 +690,10 @@ def main():
 
     # Full trading loop
     try:
-        trading_loop(trader, agent_brain, risk_manager, cost_tracker, starting_equity)
+        trading_loop(
+            trader, agent_brain, risk_manager, cost_tracker,
+            starting_equity, quant_engine=quant_eng,
+        )
     except KeyboardInterrupt:
         logger.info("Shutting down gracefully...")
         check_status(trader, cost_tracker)

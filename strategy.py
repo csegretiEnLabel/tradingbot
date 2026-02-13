@@ -331,7 +331,69 @@ def scan_universe(trader) -> list[Signal]:
         key=lambda s: s.strength,
         reverse=True,
     )
+    hold_signals = [s for s in signals if s.action == "hold"]
 
-    logger.info(f"Scan complete: {len(buy_signals)} buy, {len(sell_signals)} sell, {len(signals) - len(buy_signals) - len(sell_signals)} hold")
+    logger.info(f"Scan complete: {len(buy_signals)} buy, {len(sell_signals)} sell, {len(hold_signals)} hold")
 
-    return buy_signals + sell_signals
+    # Return ALL signals (buy + sell + hold) so quant engine can promote hold -> buy.
+    # Callers filter to buy-only as needed.
+    return buy_signals + sell_signals + hold_signals
+
+
+def enrich_signals_with_quant(
+    signals: list[Signal],
+    quant_buy_symbols: set[str],
+    all_signals_map: dict[str, Signal],
+) -> list[Signal]:
+    """
+    Enrich the signal list with quant-backed candidates.
+
+    When QUANT_AUTO_TRADE is enabled and a quant strategy says BUY for a symbol
+    that the technical scan rated as HOLD, this function promotes it to a BUY
+    candidate so the AI agent can evaluate it.
+
+    The promoted signal retains the original technical indicators (so the AI sees
+    the full picture) but gets a "quant_promoted" flag and a minimum strength
+    floor so it's not immediately filtered out.
+
+    Safety:
+      - Promoted signals still go through risk_manager + AI validation
+      - Strength is capped low (0.35) so the AI knows it's quant-only, not technical
+      - The AI prompt explicitly shows which signals are quant-promoted
+    """
+    if not config.QUANT_AUTO_TRADE or not quant_buy_symbols:
+        return signals
+
+    existing_buy_symbols = {s.symbol for s in signals if s.action == "buy"}
+    promoted_count = 0
+
+    for symbol in quant_buy_symbols:
+        if symbol in existing_buy_symbols:
+            continue  # Already a buy signal, no need to promote
+
+        # Find the original technical signal (likely "hold")
+        orig = all_signals_map.get(symbol)
+        if not orig:
+            continue
+
+        # Promote to buy with quant flag
+        promoted = Signal(
+            symbol=symbol,
+            action="buy",
+            strength=max(orig.strength, 0.35),
+            reasons=orig.reasons + ["QUANT STRATEGIES SUPPORT BUY"],
+            indicators={**orig.indicators, "quant_promoted": True},
+            price=orig.price,
+            atr_pct=orig.atr_pct,
+        )
+        signals.append(promoted)
+        promoted_count += 1
+        logger.info(
+            f"[QUANT] Promoted {symbol} from {orig.action} to buy candidate "
+            f"(tech_strength={orig.strength:.2f}, quant-backed)"
+        )
+
+    if promoted_count:
+        logger.info(f"[QUANT] Promoted {promoted_count} symbol(s) to buy candidates")
+
+    return signals

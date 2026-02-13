@@ -11,25 +11,33 @@ load_dotenv()
 def reload_config():
     """Reload environment variables from .env file."""
     load_dotenv(override=True)
-    
+
     global ANALYSIS_INTERVAL_MIN, DAILY_API_BUDGET, TRADING_MODE, STRATEGY_MODE
     global ALPACA_BASE_URL, ALPACA_DATA_URL
     global ANTHROPIC_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
     global STRATEGY_MODE
+    global QUANT_KAMA_ENABLED, QUANT_TREND_ENABLED, QUANT_MOMENTUM_ENABLED
+    global QUANT_AUTO_TRADE
 
     ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
     ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     TRADING_MODE = os.getenv("TRADING_MODE", "paper")
     STRATEGY_MODE = os.getenv("STRATEGY_MODE", "preservation")
-    
+
     ALPACA_BASE_URL = {
         "paper": "https://paper-api.alpaca.markets",
         "live": "https://api.alpaca.markets",
     }[TRADING_MODE]
-    
+
     DAILY_API_BUDGET = float(os.getenv("DAILY_API_BUDGET", "0.20"))
     ANALYSIS_INTERVAL_MIN = int(os.getenv("ANALYSIS_INTERVAL_MIN", "5"))
+
+    # Quant strategy toggles (reloadable from .env)
+    QUANT_KAMA_ENABLED = os.getenv("QUANT_KAMA_ENABLED", "true").lower() == "true"
+    QUANT_TREND_ENABLED = os.getenv("QUANT_TREND_ENABLED", "true").lower() == "true"
+    QUANT_MOMENTUM_ENABLED = os.getenv("QUANT_MOMENTUM_ENABLED", "true").lower() == "true"
+    QUANT_AUTO_TRADE = os.getenv("QUANT_AUTO_TRADE", "true").lower() == "true"
 
 # Initial load
 reload_config()
@@ -98,6 +106,33 @@ COST_KILL_THRESHOLD_DAYS = 5
 # These are percentages of STARTING equity (fetched on startup)
 HARD_KILL_DRAWDOWN_PCT = 0.10   # If equity drops 10% from start, shut down permanently
 MODEL_UPGRADE_GAIN_PCT = 0.20   # If equity grows 20% from start, upgrade scan model
+
+# ── Quantitative Strategy Parameters ────────────────────────
+# These are ported from prod_trade (prod_quant_bot_kama.py, prod_quant_bot_trend.py, prod_tradebot.py)
+# Toggle strategies on/off via .env (reloadable at runtime)
+
+# KAMA (Kaufman Adaptive Moving Average)
+# QUANT_KAMA_ENABLED is managed by reload_config()
+QUANT_KAMA_PERIOD = 10       # Lookback for efficiency ratio calculation
+QUANT_KAMA_FAST = 2          # Fast smoothing constant divisor (2-day EMA when trending)
+QUANT_KAMA_SLOW = 30         # Slow smoothing constant divisor (30-day EMA when choppy)
+
+# Trend Following (SMA Crossover)
+# QUANT_TREND_ENABLED is managed by reload_config()
+QUANT_TREND_SMA_SHORT = 3    # Fast SMA period (matches prod_trendfollow.py)
+QUANT_TREND_SMA_LONG = 20    # Slow SMA period (matches prod_trendfollow.py)
+
+# Momentum (Rolling Return Ranking)
+# QUANT_MOMENTUM_ENABLED is managed by reload_config()
+QUANT_MOMENTUM_LOOKBACK = 12  # Months of lookback for momentum calculation
+QUANT_MOMENTUM_TOP_N = 5      # Top N performers to highlight
+
+# Auto-trade: when True, quant buy signals can promote "hold" stocks to candidates
+# When False, quant signals are shown to AI as context only
+# QUANT_AUTO_TRADE is managed by reload_config()
+
+# Bar limit for quant strategies (momentum needs more history than technical)
+QUANT_BARS_LIMIT = 80         # ~3-4 months of daily bars
 
 # ── Logging ───────────────────────────────────────────────
 LOG_DIR = "logs"
