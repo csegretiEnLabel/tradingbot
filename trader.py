@@ -260,6 +260,34 @@ class Trader:
             logger.error(f"Error fetching orders: {e}")
             return []
 
+    def get_closed_orders_since(self, after: str, limit: int = 50) -> list[dict]:
+        """
+        Fetch filled sell orders since a given ISO timestamp.
+        Used to detect broker-triggered stop/TP fills that happened while the agent slept.
+        """
+        try:
+            orders = self.api.list_orders(
+                status="closed",
+                limit=limit,
+                direction="desc",
+                after=after,
+            )
+            results = []
+            for o in orders:
+                if o.side == "sell" and o.status == "filled" and o.filled_avg_price:
+                    results.append({
+                        "symbol": o.symbol,
+                        "side": o.side,
+                        "filled_qty": float(o.filled_qty or 0),
+                        "filled_avg_price": float(o.filled_avg_price),
+                        "type": o.type,  # 'stop', 'limit', 'market'
+                        "filled_at": str(o.filled_at or o.updated_at),
+                    })
+            return results
+        except Exception as e:
+            logger.error(f"Error fetching closed orders: {e}")
+            return []
+
     def update_stop_loss(self, symbol: str, new_stop_price: float) -> bool:
         """
         Cancel existing stop-loss orders for a symbol and place a new one.

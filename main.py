@@ -47,7 +47,8 @@ def print_banner():
     mode = config.TRADING_MODE.upper()
     banner = f"""
 ╔══════════════════════════════════════════════════╗
-║        🤖 AI TRADING AGENT v2.0                 ║
+║        🤖 AI TRADING AGENT v3.0                 ║
+║        "Skeptical Rationalist"                   ║
 ║        Mode: {mode:<8s}                            ║
 ║        {'⚠️  REAL MONEY' if mode == 'LIVE' else '📝 Paper Trading'}                          ║
 ╚══════════════════════════════════════════════════╝
@@ -88,6 +89,65 @@ def check_status(trader: Trader, cost_tracker: CostTracker):
     print()
 
 
+# Track positions across cycles to detect broker-triggered closes
+_known_positions: dict[str, dict] = {}  # symbol -> {avg_entry_price, qty}
+_last_reconcile_time: str = ""  # ISO timestamp of last reconciliation
+
+
+def reconcile_vanished_positions(trader: Trader, agent: Agent, current_positions: list[dict]):
+    """
+    Detect positions that disappeared between cycles (broker-triggered stop/TP fills).
+    Records P&L for wash sale tracking so vanished losses still blacklist the symbol.
+    """
+    global _known_positions, _last_reconcile_time
+
+    current_symbols = {p["symbol"] for p in current_positions}
+    vanished_symbols = set(_known_positions.keys()) - current_symbols
+
+    if vanished_symbols:
+        logger.info(f"🔍 Position reconciliation: {vanished_symbols} vanished since last cycle")
+
+        # Check Alpaca closed orders to find what happened
+        closed_orders = trader.get_closed_orders_since(
+            after=_last_reconcile_time or datetime.utcnow().replace(hour=0, minute=0).isoformat() + "Z"
+        )
+
+        for symbol in vanished_symbols:
+            entry_info = _known_positions[symbol]
+            entry_price = entry_info["avg_entry_price"]
+
+            # Find the matching fill from closed orders
+            fill = next((o for o in closed_orders if o["symbol"] == symbol), None)
+            if fill:
+                exit_price = fill["filled_avg_price"]
+                qty = fill["filled_qty"]
+                pnl = (exit_price - entry_price) * qty
+                logger.info(
+                    f"📋 Reconciled {symbol}: entry=${entry_price:.2f} → "
+                    f"exit=${exit_price:.2f} ({fill['type']}) PL=${pnl:.2f}"
+                )
+            else:
+                # Can't find the order — estimate from last known data
+                pnl = entry_info.get("unrealized_pl", 0)
+                logger.warning(
+                    f"⚠️ Cannot find close order for {symbol}. Estimating PL=${pnl:.2f}"
+                )
+
+            agent.record_closed_trade(symbol, pnl)
+            agent.record_trade(symbol, "sell", f"broker_closed_pl{pnl:+.2f}")
+
+    # Update known positions for next cycle
+    _known_positions = {
+        p["symbol"]: {
+            "avg_entry_price": p["avg_entry_price"],
+            "qty": p["qty"],
+            "unrealized_pl": p.get("unrealized_pl", 0),
+        }
+        for p in current_positions
+    }
+    _last_reconcile_time = datetime.utcnow().isoformat() + "Z"
+
+
 def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_tracker: CostTracker, starting_equity: float):
     """
     Run one complete analysis → decision → execution cycle.
@@ -114,6 +174,9 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
 
     account = trader.get_account()
     positions = trader.get_positions()
+
+    # ── Reconcile vanished positions (broker-triggered stop/TP fills) ──
+    reconcile_vanished_positions(trader, agent, positions)
 
     # Update agent's equity awareness for dynamic prompts
     agent.equity = account["equity"]
@@ -147,14 +210,27 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
     for action in risk_actions:
         if action["action"] == "emergency_close":
             logger.warning(f"Emergency close: {action['symbol']} — {action['reason']}")
-            decision = agent.should_close_position(
-                next(p for p in positions if p["symbol"] == action["symbol"]),
-                account,
-            )
-            if decision and decision.get("close", True):
-                trader.sell(action["symbol"])
-                agent.record_trade(action["symbol"], "sell", "emergency_close")
-                logger.info(f"Closed {action['symbol']}: {decision.get('reasoning', '')}")
+            pos = next((p for p in positions if p["symbol"] == action["symbol"]), None)
+            if not pos:
+                continue
+            decision = agent.should_close_position(pos, account)
+            if decision:
+                act = decision.get("action", "close")
+                reason = decision.get("reasoning", "")
+                if act == "close":
+                    # Capture P&L before selling for wash sale tracking
+                    pnl = float(pos.get("unrealized_pl", 0))
+                    trader.sell(action["symbol"])
+                    agent.record_trade(action["symbol"], "sell", "emergency_close")
+                    agent.record_closed_trade(action["symbol"], pnl)
+                    logger.info(f"Closed {action['symbol']} (PL=${pnl:.2f}): {reason}")
+                elif act == "update_stop":
+                    new_stop = decision.get("new_stop_price")
+                    if new_stop:
+                        trader.update_stop_loss(action["symbol"], new_stop)
+                        logger.info(f"AI moved stop for {action['symbol']} to ${new_stop:.2f}: {reason}")
+                else:
+                    logger.info(f"AI chose to hold {action['symbol']} despite emergency flag: {reason}")
 
         elif action["action"] == "update_trailing_stop":
             stop_price = action.get("stop_price")
@@ -173,90 +249,112 @@ def run_cycle(trader: Trader, agent: Agent, risk_manager: RiskManager, cost_trac
     # ── Step 3: Scan for New Opportunities ───────────
     logger.info(f"Scanning {len(config.WATCHLIST)} symbols...")
     signals = scan_universe(trader)
-    buy_signals = [s for s in signals if s.action == "buy"]
+
+    # Filter: don't show AI signals for stocks we already hold (no pyramiding)
+    current_holdings = {p["symbol"] for p in positions}
+    buy_signals = [s for s in signals if s.action == "buy" and s.symbol not in current_holdings]
 
     if not buy_signals:
-        logger.info("No buy signals found. Sitting tight.")
+        logger.info("No buy signals found. Cash is a position. Sitting tight.")
         return
 
-    logger.info(f"Found {len(buy_signals)} buy signals. Consulting AI...")
+    logger.info(f"Found {len(buy_signals)} buy signal(s). Consulting skeptical screener...")
 
-    # ── Step 4: AI Analysis (Haiku - cheap) ──────────
+    # ── Step 4: Skeptical Screener (Haiku — cheap) ───
+    # Returns at most 1 trade idea (max 1 per cycle enforced in agent)
     trade_ideas = agent.analyze_signals(signals, account, positions, market_context)
 
     if not trade_ideas:
-        logger.info("AI found no compelling trades. Staying in cash.")
+        logger.info("Screener rejected all signals. No A+ setups. Staying in cash.")
         return
 
-    logger.info(f"AI suggested {len(trade_ideas)} trade(s)")
+    # Only process the single best idea (enforced)
+    idea = trade_ideas[0]
+    symbol = idea.get("symbol")
+    action = idea.get("action", "buy")
 
-    # ── Step 5: Execute Trades ───────────────────────
-    for idea in trade_ideas:
-        symbol = idea.get("symbol")
-        action = idea.get("action", "buy")
-        conviction = idea.get("conviction", "medium")
+    if action != "buy":
+        logger.info(f"Screener suggested non-buy action for {symbol}: {action}. Skipping.")
+        return
 
-        if action != "buy":
-            continue  # Only handle buys for now; sells handled by bracket orders
+    # Find matching signal
+    matching_signal = next((s for s in signals if s.symbol == symbol), None)
+    if not matching_signal:
+        logger.warning(f"Signal not found for {symbol}. Skipping.")
+        return
 
-        # Find matching signal
-        matching_signal = next((s for s in signals if s.symbol == symbol), None)
-        if not matching_signal:
-            continue
+    # ── Step 5: Risk Manager Check ───────────────────
+    risk = risk_manager.check_trade(
+        symbol=symbol,
+        side="buy",
+        price=matching_signal.price,
+        atr_pct=matching_signal.atr_pct,
+    )
 
-        # Risk check
-        risk = risk_manager.check_trade(
-            symbol=symbol,
-            side="buy",
-            price=matching_signal.price,
-            atr_pct=matching_signal.atr_pct,
-        )
+    if not risk.approved:
+        logger.info(f"Risk Manager rejected {symbol}: {risk.reason}")
+        return
 
-        if not risk.approved:
-            logger.info(f"Risk rejected {symbol}: {risk.reason}")
-            continue
+    # ── Step 6: Devil's Advocate Validation (Sonnet) ─
+    # EVERY trade goes through pre-mortem. No exceptions.
+    # This is the most important gate — Sonnet is smarter and catches what Haiku misses.
+    logger.info(f"Validating {symbol} with Devil's Advocate (Sonnet)...")
+    validation = agent.validate_trade(symbol, matching_signal, account)
 
-        # For high-conviction trades, do final validation with Sonnet
-        if conviction == "high" and risk.max_notional >= 5.0:
-            logger.info(f"High-conviction trade: validating {symbol} with Sonnet...")
-            validation = agent.validate_trade(matching_signal, matching_signal, account)
-            if validation and not validation.get("approved", False):
-                logger.info(f"Sonnet rejected {symbol}: {validation.get('reasoning', '')}")
-                agent.record_trade(symbol, "buy", "sonnet_rejected")
-                continue
-            if validation:
-                # Use Sonnet's refined parameters
-                risk.adjusted_stop_loss = validation.get("stop_loss_pct", risk.adjusted_stop_loss)
-                risk.adjusted_take_profit = validation.get("take_profit_pct", risk.adjusted_take_profit)
-
-        # Execute!
-        notional = min(risk.max_notional, idea.get("suggested_notional", risk.max_notional))
-        notional = max(notional, config.MIN_TRADE_VALUE)
-
+    if not validation or not validation.get("approved", False):
+        reasons = validation.get("failure_reasons", []) if validation else ["API error"]
+        reasoning = validation.get("reasoning", "No reason given") if validation else "Validation failed"
         logger.info(
-            f"EXECUTING: BUY {symbol} | ${notional:.2f} | "
-            f"SL: {risk.adjusted_stop_loss:.1%} | TP: {risk.adjusted_take_profit:.1%}"
+            f"Devil's Advocate KILLED {symbol}: {reasoning}\n"
+            f"  Failure scenarios: {'; '.join(reasons)}"
         )
+        agent.record_trade(symbol, "buy", "sonnet_rejected")
+        return
 
-        result = trader.buy(
-            symbol=symbol,
-            notional=notional,
-            stop_loss_pct=risk.adjusted_stop_loss,
-            take_profit_pct=risk.adjusted_take_profit,
-        )
+    # Use Sonnet's refined parameters (tighter stops, enforced R:R)
+    sl = validation.get("stop_loss_pct", risk.adjusted_stop_loss)
+    tp = validation.get("take_profit_pct", risk.adjusted_take_profit)
+    size_pct = validation.get("position_size_pct", 0.10)
 
-        if result:
-            # Verify fill
-            fill = trader.verify_order_fill(result["id"])
-            if fill:
-                logger.info(f"Order FILLED: {fill}")
-                agent.record_trade(symbol, "buy", "filled")
-            else:
-                logger.warning(f"Order placed but fill not confirmed: {result}")
-                agent.record_trade(symbol, "buy", "unconfirmed")
+    # Enforce 3:1 R:R minimum
+    if tp < sl * 3:
+        tp = round(sl * 3, 4)
+        logger.info(f"Adjusted TP to {tp:.1%} to enforce 3:1 R:R (SL={sl:.1%})")
+
+    risk.adjusted_stop_loss = sl
+    risk.adjusted_take_profit = tp
+
+    # ── Step 7: Execute ──────────────────────────────
+    # Use Sonnet's recommended size, capped by risk manager
+    notional = min(account["equity"] * size_pct, risk.max_notional)
+    notional = min(notional, idea.get("suggested_notional", notional))
+    notional = max(notional, config.MIN_TRADE_VALUE)
+
+    logger.info(
+        f"🎯 EXECUTING: BUY {symbol} | ${notional:.2f} | "
+        f"SL: {sl:.1%} | TP: {tp:.1%} | "
+        f"Confidence: {validation.get('confidence', '?')} | "
+        f"R:R = 1:{tp/sl:.1f}"
+    )
+
+    result = trader.buy(
+        symbol=symbol,
+        notional=notional,
+        stop_loss_pct=sl,
+        take_profit_pct=tp,
+    )
+
+    if result:
+        fill = trader.verify_order_fill(result["id"])
+        if fill:
+            logger.info(f"✅ Order FILLED: {fill}")
+            agent.record_trade(symbol, "buy", "filled")
         else:
-            logger.error(f"Order failed for {symbol}")
-            agent.record_trade(symbol, "buy", "failed")
+            logger.warning(f"Order placed but fill not confirmed: {result}")
+            agent.record_trade(symbol, "buy", "unconfirmed")
+    else:
+        logger.error(f"❌ Order failed for {symbol}")
+        agent.record_trade(symbol, "buy", "failed")
 
     # ── Update Cost Tracker ──────────────────────────
     cost_tracker.update_trading_pnl(account["daily_pnl"])
