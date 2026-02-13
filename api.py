@@ -11,6 +11,8 @@ from pydantic import BaseModel
 import config
 from trader import Trader
 from cost_tracker import CostTracker
+from quant_engine import QuantEngine
+from intervention_tracker import InterventionTracker
 
 class SettingsUpdate(BaseModel):
     strategy: str
@@ -20,6 +22,10 @@ class QuantSettingsUpdate(BaseModel):
     trend_enabled: Optional[bool] = None
     momentum_enabled: Optional[bool] = None
     auto_trade: Optional[bool] = None
+
+class StockAnalysisRequest(BaseModel):
+    symbol: str
+    days_back: Optional[int] = 30
 
 app = FastAPI(title="Trading Bot API")
 
@@ -210,6 +216,150 @@ def _update_env_var(key: str, value: str):
 
     with open(env_path, "w") as f:
         f.writelines(lines)
+
+@app.get("/api/quant/signals")
+async def get_quant_signals():
+    """Get current signals for all strategies and all symbols."""
+    try:
+        quant_engine = QuantEngine()
+        if not quant_engine.is_active():
+            return {"error": "No quant strategies enabled"}
+        
+        all_signals = quant_engine.get_all_current_signals()
+        
+        # Convert to JSON-serializable format
+        result = {}
+        for symbol, strategies in all_signals.items():
+            result[symbol] = {}
+            for strategy_name, signal in strategies.items():
+                if signal:
+                    result[symbol][strategy_name] = {
+                        "action": signal.action,
+                        "strength": signal.strength,
+                        "reasoning": signal.reasoning,
+                        "metrics": signal.metrics,
+                        "timestamp": signal.timestamp,
+                    }
+                else:
+                    result[symbol][strategy_name] = None
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quant/signals/{symbol}")
+async def get_quant_signals_for_symbol(symbol: str):
+    """Get signals for a specific symbol."""
+    try:
+        quant_engine = QuantEngine()
+        if not quant_engine.is_active():
+            return {"error": "No quant strategies enabled"}
+        
+        all_signals = quant_engine.get_all_current_signals()
+        
+        if symbol not in all_signals:
+            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not in watchlist")
+        
+        strategies = all_signals[symbol]
+        result = {}
+        for strategy_name, signal in strategies.items():
+            if signal:
+                result[strategy_name] = {
+                    "action": signal.action,
+                    "strength": signal.strength,
+                    "reasoning": signal.reasoning,
+                    "metrics": signal.metrics,
+                    "timestamp": signal.timestamp,
+                }
+            else:
+                result[strategy_name] = None
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/quant/analyze")
+async def analyze_stock(request: StockAnalysisRequest):
+    """Analyze a custom stock through all strategies."""
+    try:
+        trader = Trader()
+        quant_engine = QuantEngine()
+        
+        if not quant_engine.is_active():
+            return {"error": "No quant strategies enabled"}
+        
+        result = quant_engine.analyze_single_stock(
+            request.symbol.upper(),
+            trader,
+            days_back=request.days_back
+        )
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quant/interventions")
+async def get_interventions(limit: int = 50, symbol: Optional[str] = None):
+    """Get recent interventions (AI/risk manager decisions)."""
+    try:
+        tracker = InterventionTracker()
+        interventions = tracker.get_intervention_history(
+            symbol=symbol,
+            limit=limit
+        )
+        
+        # Convert to dict for JSON serialization
+        return [
+            {
+                "signal_id": i.signal_id,
+                "symbol": i.symbol,
+                "intervener": i.intervener,
+                "action": i.action,
+                "reasoning": i.reasoning,
+                "timestamp": i.timestamp,
+                "original_action": i.original_action,
+                "final_action": i.final_action,
+                "strategy": i.strategy,
+            }
+            for i in interventions
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quant/interventions/stats")
+async def get_intervention_stats(days: int = 7):
+    """Get rejection statistics."""
+    try:
+        tracker = InterventionTracker()
+        stats = tracker.get_rejection_stats(days=days)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quant/dashboard")
+async def get_quant_dashboard():
+    """Get comprehensive dashboard summary."""
+    try:
+        quant_engine = QuantEngine()
+        if not quant_engine.is_active():
+            return {"error": "No quant strategies enabled"}
+        
+        summary = quant_engine.get_dashboard_summary()
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quant/performance")
+async def get_strategy_performance():
+    """Get performance metrics for each strategy."""
+    try:
+        tracker = InterventionTracker()
+        approval_rates = tracker.get_strategy_approval_rates()
+        return approval_rates
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

@@ -40,5 +40,11 @@
     "api_cost": 0.0,
     "trading_pnl": 0.0,
     "net": 0.0
+  },
+  {
+    "date": "2026-02-13",
+    "api_cost": 0.046854,
+    "trading_pnl": -112.9,
+    "net": -112.9469
   }
 ]

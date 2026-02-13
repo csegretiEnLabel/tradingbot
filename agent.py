@@ -20,6 +20,7 @@ import anthropic
 
 import config
 from cost_tracker import CostTracker
+from intervention_tracker import InterventionTracker
 from strategy import Signal
 
 logger = logging.getLogger(__name__)
@@ -94,9 +95,10 @@ class Agent:
     TRADE_HISTORY_FILE = os.path.join("data", "trade_history.json")
     WASH_SALE_DAYS = 31  # IRS wash sale window
 
-    def __init__(self, cost_tracker: CostTracker, initial_equity: float = 100.0):
+    def __init__(self, cost_tracker: CostTracker, initial_equity: float = 100.0, intervention_tracker: InterventionTracker = None):
         self.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
         self.cost_tracker = cost_tracker
+        self.intervention_tracker = intervention_tracker or InterventionTracker()
         self.equity = initial_equity  # Updated each cycle from live Alpaca data
         self.scan_model = config.MODEL_SCAN  # Instance-level, can be upgraded at runtime
         self.recent_trades: list[dict] = []  # Track recent trades to avoid re-entry
@@ -268,6 +270,7 @@ class Agent:
         positions: list[dict],
         market_context: Optional[dict] = None,
         quant_signals_text: str = "",
+        quant_signals_map: Optional[dict] = None,
     ) -> list[dict]:
         """
         Skeptical signal screener. Rejects most signals; returns at most 1 trade.
@@ -285,6 +288,20 @@ class Agent:
         for s in signals:
             if s.symbol in banned:
                 logger.info(f"WASH SALE: Skipping {s.symbol} (sold at loss within 31 days)")
+                # Record wash sale intervention
+                if quant_signals_map and s.symbol in quant_signals_map:
+                    for quant_sig in quant_signals_map[s.symbol]:
+                        if quant_sig.action == "buy":
+                            self.intervention_tracker.record_intervention(
+                                signal_id=quant_sig.signal_id,
+                                symbol=s.symbol,
+                                intervener="AI_AGENT",
+                                action="REJECTED",
+                                reasoning=f"Wash sale rule: {s.symbol} sold at loss within 31 days",
+                                original_action="BUY",
+                                final_action="HOLD",
+                                strategy=quant_sig.strategy,
+                            )
             else:
                 clean_signals.append(s)
 
@@ -366,11 +383,43 @@ Empty [] if nothing is A+ quality."""
 
         response = self._call_claude(prompt, model=self.scan_model)
         if not response:
+            # Record AI call failure as intervention
+            for s in clean_signals[:1]:  # Only first signal was candidate
+                if quant_signals_map and s.symbol in quant_signals_map:
+                    for quant_sig in quant_signals_map[s.symbol]:
+                        self.intervention_tracker.record_intervention(
+                            signal_id=quant_sig.signal_id,
+                            symbol=s.symbol,
+                            intervener="AI_AGENT",
+                            action="REJECTED",
+                            reasoning="AI call failed (budget or API error)",
+                            original_action=quant_sig.action.upper(),
+                            final_action="HOLD",
+                            strategy=quant_sig.strategy,
+                        )
             return []
 
         result = self._parse_json(response)
         if not isinstance(result, list):
             return []
+        
+        # Record rejection for signals AI didn't select
+        if len(result) == 0 and quant_signals_map:
+            # AI rejected all signals
+            for s in clean_signals[:3]:  # Track first 3 rejections
+                if s.symbol in quant_signals_map:
+                    for quant_sig in quant_signals_map[s.symbol]:
+                        if quant_sig.action == "buy":
+                            self.intervention_tracker.record_intervention(
+                                signal_id=quant_sig.signal_id,
+                                symbol=s.symbol,
+                                intervener="AI_AGENT",
+                                action="REJECTED",
+                                reasoning="AI skeptical screener rejected all signals as not A+ quality",
+                                original_action="BUY",
+                                final_action="HOLD",
+                                strategy=quant_sig.strategy,
+                            )
 
         # Enforce max 1 trade per cycle
         return result[:1]
@@ -458,6 +507,36 @@ Minimum confidence to approve: 0.80. When in doubt, reject."""
             result["approved"] = False
             result["reasoning"] = f"Confidence {confidence:.0%} below 80% threshold"
             logger.info(f"Sonnet rejected {symbol}: confidence {confidence:.0%} < 80%")
+            
+            # Record AI rejection
+            if quant_consensus and quant_consensus.get("strategies"):
+                for strat in quant_consensus["strategies"]:
+                    # Find signal ID from quant signal
+                    # Note: signal_id would need to be passed through, for now use strategy+symbol
+                    self.intervention_tracker.record_intervention(
+                        signal_id=f"{strat['strategy']}-{symbol}",
+                        symbol=symbol,
+                        intervener="AI_AGENT",
+                        action="REJECTED",
+                        reasoning=f"Devil's Advocate confidence {confidence:.0%} below 80% threshold",
+                        original_action="BUY",
+                        final_action="HOLD",
+                        strategy=strat['strategy'],
+                    )
+        elif result.get("approved"):
+            # Record AI approval
+            if quant_consensus and quant_consensus.get("strategies"):
+                for strat in quant_consensus["strategies"]:
+                    self.intervention_tracker.record_intervention(
+                        signal_id=f"{strat['strategy']}-{symbol}",
+                        symbol=symbol,
+                        intervener="AI_AGENT",
+                        action="APPROVED",
+                        reasoning=f"Devil's Advocate approved with {confidence:.0%} confidence",
+                        original_action="BUY",
+                        final_action="BUY",
+                        strategy=strat['strategy'],
+                    )
 
         return result
 

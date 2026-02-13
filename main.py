@@ -348,6 +348,7 @@ def run_cycle(
     trade_ideas = agent.analyze_signals(
         actionable_signals, account, positions, market_context,
         quant_signals_text=quant_signals_text,
+        quant_signals_map=quant_signals if quant_signals else None,
     )
 
     if not trade_ideas:

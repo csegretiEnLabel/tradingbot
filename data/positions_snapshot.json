@@ -3,18 +3,18 @@
     "AMZN": {
       "avg_entry_price": 187.479,
       "qty": 10.0,
-      "unrealized_pl": 124.11
+      "unrealized_pl": 106.46
     },
     "AYI": {
       "avg_entry_price": 299.56,
       "qty": 10.0,
-      "unrealized_pl": 116.3
+      "unrealized_pl": 70.4
     },
     "NVDA": {
       "avg_entry_price": 134.8,
       "qty": 10.0,
-      "unrealized_pl": 495.7
+      "unrealized_pl": 469.355
     }
   },
-  "last_reconcile_time": "2026-02-13T18:44:32.984151+00:00"
+  "last_reconcile_time": "2026-02-13T20:43:04.751426+00:00"
 }

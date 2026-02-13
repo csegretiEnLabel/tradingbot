@@ -15,10 +15,13 @@ All strategies:
   - Log every signal change for full auditability
 """
 
+import json
 import logging
 import numpy as np
+import os
 import pandas as pd
-from dataclasses import dataclass
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -38,6 +41,10 @@ class QuantSignal:
     strength: float     # 0.0 to 1.0
     metrics: dict       # Strategy-specific metrics for AI context
     reasoning: str
+    signal_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    price_at_signal: Optional[float] = None
+    state: str = "generated"  # "generated", "acted_on", "rejected", "expired"
 
 
 # ── KAMA Strategy ───────────────────────────────────────────
@@ -373,6 +380,8 @@ class QuantEngine:
       - Errors in one strategy don't crash others (isolated try/except)
     """
 
+    SIGNAL_HISTORY_FILE = os.path.join("data", "signal_history.jsonl")
+    
     def __init__(self):
         self.kama = KAMAStrategy(
             period=config.QUANT_KAMA_PERIOD,
@@ -394,6 +403,11 @@ class QuantEngine:
         self._signal_history: dict[tuple[str, str], list[dict]] = {}
         # Track previous signal actions to detect state changes
         self._prev_actions: dict[tuple[str, str], str] = {}
+        # Current signals cache (latest signal per strategy/symbol)
+        self._current_signals: dict[tuple[str, str], QuantSignal] = {}
+        
+        # Ensure data directory exists
+        os.makedirs("data", exist_ok=True)
 
         active = self._active_strategy_names()
         if active:
@@ -502,6 +516,9 @@ class QuantEngine:
         """Record signal and log state changes (crossovers, flips)."""
         key = (sig.strategy, sig.symbol)
 
+        # Store current signal
+        self._current_signals[key] = sig
+        
         # Detect state change from previous signal
         prev_action = self._prev_actions.get(key)
         is_state_change = prev_action is not None and prev_action != sig.action
@@ -518,6 +535,9 @@ class QuantEngine:
         self._signal_history[key] = self._signal_history[key][-50:]
 
         self._prev_actions[key] = sig.action
+        
+        # Persist to disk
+        self._save_signal_to_file(sig)
 
         # Log actionable signals (not hold) and state changes
         if sig.action != "hold":
@@ -532,6 +552,14 @@ class QuantEngine:
                 f"[QUANT:{sig.strategy.upper()}] {sig.symbol} -> HOLD "
                 f"(was {prev_action.upper()}) | {sig.reasoning}"
             )
+    
+    def _save_signal_to_file(self, sig: QuantSignal):
+        """Persist signal to JSONL file."""
+        try:
+            with open(self.SIGNAL_HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(sig)) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to save signal to file: {e}")
 
     def get_quant_buy_symbols(
         self, quant_signals: dict[str, list[QuantSignal]]
@@ -640,3 +668,190 @@ class QuantEngine:
                 summary["signals"][symbol][strategy] = latest
 
         return summary
+    
+    def get_all_current_signals(self) -> dict[str, dict[str, QuantSignal]]:
+        """
+        Get current signal from each strategy for every stock in watchlist.
+        Returns {symbol: {strategy: QuantSignal}}.
+        Shows 'HOLD' when no active signal.
+        """
+        result = {}
+        
+        for symbol in config.WATCHLIST:
+            result[symbol] = {}
+            
+            # Check each enabled strategy
+            if self.kama:
+                key = ("kama", symbol)
+                result[symbol]["kama"] = self._current_signals.get(key)
+            
+            if self.trend:
+                key = ("trend_follow", symbol)
+                result[symbol]["trend_follow"] = self._current_signals.get(key)
+            
+            if self.momentum:
+                key = ("momentum", symbol)
+                result[symbol]["momentum"] = self._current_signals.get(key)
+        
+        return result
+    
+    def analyze_single_stock(
+        self, 
+        symbol: str, 
+        trader,
+        days_back: int = 30
+    ) -> dict:
+        """
+        Analyze a single stock through all enabled strategies.
+        Returns detailed breakdown with signals, metrics, and consensus.
+        
+        Args:
+            symbol: Stock symbol to analyze
+            trader: Trader instance for fetching data
+            days_back: Days of historical data to use
+            
+        Returns:
+            {
+                "symbol": "AAPL",
+                "timestamp": "2026-02-13T15:30:00",
+                "strategies": {
+                    "kama": {signal_dict},
+                    "trend_follow": {signal_dict},
+                    "momentum": {signal_dict}
+                },
+                "consensus": {"action": "buy", "agreement": 0.67, ...},
+                "suggested_entry": 150.25,
+                "stop_loss": 146.50,
+                "take_profit": 157.75
+            }
+        """
+        from strategy import _get_cached_bars
+        
+        # Fetch data
+        bar_limit = max(days_back, config.QUANT_BARS_LIMIT)
+        try:
+            df = _get_cached_bars(trader, symbol, timeframe="1Day", limit=bar_limit)
+        except Exception as e:
+            logger.error(f"Failed to fetch bars for {symbol}: {e}")
+            return {"error": str(e)}
+        
+        if df.empty:
+            return {"error": f"No data available for {symbol}"}
+        
+        # Run all strategies
+        signals = self.scan_symbol(symbol, df)
+        
+        # Format results
+        current_price = df["close"].iloc[-1]
+        strategies = {}
+        
+        for sig in signals:
+            strategies[sig.strategy] = asdict(sig)
+        
+        # Get consensus
+        consensus = self.get_consensus({symbol: signals}, symbol)
+        
+        # Calculate suggested levels (simple ATR-based)
+        atr = df["close"].diff().abs().rolling(14).mean().iloc[-1]
+        stop_distance = atr * 2.5
+        tp_distance = atr * 5
+        
+        return {
+            "symbol": symbol,
+            "timestamp": datetime.now().isoformat(),
+            "current_price": round(current_price, 2),
+            "strategies": strategies,
+            "consensus": consensus,
+            "suggested_entry": round(current_price, 2),
+            "stop_loss": round(current_price - stop_distance, 2),
+            "take_profit": round(current_price + tp_distance, 2),
+            "atr_14": round(atr, 2),
+        }
+    
+    def get_dashboard_summary(self) -> dict:
+        """
+        Comprehensive summary for dashboard display.
+        Shows signals grouped by strategy with consensus and conflicts.
+        """
+        all_signals = self.get_all_current_signals()
+        
+        # Build strategy-centric view
+        strategy_views = {}
+        
+        for strategy_name in ["kama", "trend_follow", "momentum"]:
+            is_enabled = getattr(self, strategy_name.split("_")[0]) is not None
+            if not is_enabled:
+                continue
+            
+            buy_signals = []
+            sell_signals = []
+            hold_signals = []
+            
+            for symbol, strategies in all_signals.items():
+                sig = strategies.get(strategy_name)
+                if sig:
+                    signal_data = {
+                        "symbol": symbol,
+                        "strength": sig.strength,
+                        "reasoning": sig.reasoning,
+                        "metrics": sig.metrics,
+                    }
+                    
+                    if sig.action == "buy":
+                        buy_signals.append(signal_data)
+                    elif sig.action == "sell":
+                        sell_signals.append(signal_data)
+                    else:
+                        hold_signals.append(signal_data)
+            
+            strategy_views[strategy_name] = {
+                "enabled": True,
+                "signals": {
+                    "buy": len(buy_signals),
+                    "sell": len(sell_signals),
+                    "hold": len(hold_signals),
+                },
+                "top_buy_signals": sorted(
+                    buy_signals, key=lambda x: x["strength"], reverse=True
+                )[:5],
+            }
+        
+        # Find consensus and conflicts
+        consensus_buys = []
+        conflicts = []
+        
+        for symbol, strategies in all_signals.items():
+            signals = [s for s in strategies.values() if s is not None]
+            if not signals:
+                continue
+            
+            actions = [s.action for s in signals]
+            buy_count = actions.count("buy")
+            sell_count = actions.count("sell")
+            
+            # Consensus: all agree
+            if len(signals) >= 2 and buy_count == len(signals):
+                consensus_buys.append(symbol)
+            # Conflict: mixed signals
+            elif buy_count > 0 and sell_count > 0:
+                conflicts.append({
+                    "symbol": symbol,
+                    **{s.strategy: s.action for s in signals}
+                })
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "strategies": strategy_views,
+            "consensus_buys": consensus_buys,
+            "conflicts": conflicts,
+        }
+    
+    def link_trade_to_signals(self, trade_id: str, signal_ids: list[str]):
+        """Link executed trade to originating signals."""
+        # Mark signals as acted upon
+        for key, sig in self._current_signals.items():
+            if sig.signal_id in signal_ids:
+                sig.state = "acted_on"
+                logger.info(
+                    f"[QUANT] Signal {sig.signal_id} linked to trade {trade_id}"
+                )
